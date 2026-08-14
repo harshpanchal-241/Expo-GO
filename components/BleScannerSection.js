@@ -28,6 +28,11 @@ import {
   ONE_EURO_BETA
 } from "../services/BleScannerService.js";
 
+let Updates = null;
+try {
+  Updates = require("expo-updates");
+} catch (e) {}
+
 export default function BleScannerSection() {
   const [isScanning, setIsScanning] = useState(false);
   const [devices, setDevices] = useState({});
@@ -36,6 +41,8 @@ export default function BleScannerSection() {
   const [environmentalN, setEnvironmentalN] = useState(DEFAULT_ENV_N);
   const [txPower1m, setTxPower1m] = useState(DEFAULT_TX_POWER);
   const [isExpoGoNotice, setIsExpoGoNotice] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [updateStatusText, setUpdateStatusText] = useState("");
 
   const isScanningRef = useRef(false);
   const simIntervalRef = useRef(null);
@@ -255,6 +262,47 @@ export default function BleScannerSection() {
     setDevices({});
   };
 
+  const handleCheckForUpdate = async () => {
+    if (!Updates || !Updates.checkForUpdateAsync) {
+      Alert.alert("EAS Updates", "OTA updates are enabled on standalone builds. In development mode, changes reload automatically via Metro bundler.");
+      return;
+    }
+
+    try {
+      setIsCheckingUpdate(true);
+      setUpdateStatusText("Checking for latest OTA update...");
+      const check = await Updates.checkForUpdateAsync();
+      
+      if (check.isAvailable) {
+        setUpdateStatusText("Downloading new update...");
+        await Updates.fetchUpdateAsync();
+        Alert.alert(
+          "Update Downloaded! 🎉",
+          "A new version of the app has been downloaded. Would you like to reload now to apply it?",
+          [
+            { text: "Later", style: "cancel" },
+            {
+              text: "Reload Now",
+              onPress: async () => {
+                await Updates.reloadAsync();
+              }
+            }
+          ]
+        );
+        setUpdateStatusText("Update downloaded. Reload to apply.");
+      } else {
+        setUpdateStatusText("App is already up to date!");
+        Alert.alert("Up to Date", "Your app is currently running the latest available code.");
+      }
+    } catch (e) {
+      console.warn("OTA update check error:", e);
+      setUpdateStatusText("Update check completed.");
+      Alert.alert("Update Check", e.message || "Failed to check for updates.");
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
   // Convert device dictionary to sorted list (closest / strongest first)
   const deviceList = Object.values(devices)
     .filter((d) => !filterNamedOnly || (d.name && d.name.trim().length > 0))
@@ -444,6 +492,27 @@ export default function BleScannerSection() {
           })}
         </ScrollView>
       )}
+
+      {/* OTA Update Checker Card */}
+      <View style={s.otaBox}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.otaTitle}>Over-The-Air (OTA) Updates</Text>
+          <Text style={s.otaSub}>
+            {updateStatusText || `Runtime: 1.0.0 • Channel: preview`}
+          </Text>
+        </View>
+        <Pressable
+          onPress={handleCheckForUpdate}
+          disabled={isCheckingUpdate}
+          style={[s.otaBtn, isCheckingUpdate && { opacity: 0.6 }]}
+        >
+          {isCheckingUpdate ? (
+            <ActivityIndicator size="small" color="#1f6feb" />
+          ) : (
+            <Text style={s.otaBtnText}>🔄 Check Update</Text>
+          )}
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -741,5 +810,41 @@ const s = StyleSheet.create({
   footerText: {
     fontSize: 10,
     color: "#8c959f",
+  },
+  otaBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#f6f8fa",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    padding: 10,
+    marginTop: 8,
+  },
+  otaTitle: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#24292f",
+  },
+  otaSub: {
+    fontSize: 10,
+    color: "#57606a",
+    marginTop: 1,
+  },
+  otaBtn: {
+    backgroundColor: "#ffffff",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#1f6feb",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  otaBtnText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#1f6feb",
   },
 });
