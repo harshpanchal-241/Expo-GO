@@ -7,9 +7,10 @@ import {
   ScrollView,
   ActivityIndicator,
   Alert,
-  Switch
+  Switch,
+  Dimensions
 } from "react-native";
-import Svg, { Polyline, Circle, Line, Rect } from "react-native-svg";
+import Svg, { Polyline, Circle, Line } from "react-native-svg";
 import {
   getBleManager,
   getSignalQuality,
@@ -19,14 +20,7 @@ import {
   UI_UPDATE_INTERVAL_MS,
   INITIAL_SAMPLE_SIZE,
   DEFAULT_TX_POWER,
-  DEFAULT_ENV_N,
-  STATIONARY_STEP_LIMIT,
-  MOVING_STEP_LIMIT,
-  DEAD_ZONE,
-  APPROACH_SENSITIVITY,
-  AWAY_SENSITIVITY,
-  ONE_EURO_MIN_CUTOFF,
-  ONE_EURO_BETA
+  DEFAULT_ENV_N
 } from "../services/BleScannerService.js";
 
 let Updates = null;
@@ -324,7 +318,7 @@ export default function BleScannerSection() {
       return a.distance - b.distance;
     });
 
-  const focusedDevice = focusedDeviceId ? devices[focusedDeviceId] : null;
+  const focusedDevice = focusedDeviceId ? (devices[focusedDeviceId] || deviceMetaRef.current.get(focusedDeviceId)) : null;
 
   return (
     <View style={s.card}>
@@ -389,7 +383,7 @@ export default function BleScannerSection() {
           <View style={s.focusedHeaderCard}>
             <View style={{ flex: 1 }}>
               <Text style={s.focusedName}>{focusedDevice.name || "Unnamed Target Beacon"}</Text>
-              <Text style={s.focusedId}>UUID / MAC: {focusedDevice.id}</Text>
+              <Text style={s.focusedId}>UUID / MAC: {focusedDevice.id || focusedDeviceId}</Text>
             </View>
             <View style={s.focusedStatusGroup}>
               {focusedDevice.isLocked ? (
@@ -409,14 +403,14 @@ export default function BleScannerSection() {
             <Text style={s.focusedHeroTitle}>ESTIMATED PHYSICAL DISTANCE</Text>
             <View style={s.focusedDistanceRow}>
               <Text style={s.focusedDistanceNumber}>
-                {focusedDevice.distance !== null ? `${focusedDevice.distance}` : "--"}
+                {focusedDevice.distance !== undefined && focusedDevice.distance !== null ? `${focusedDevice.distance}` : "--"}
               </Text>
               <Text style={s.focusedDistanceUnit}>meters</Text>
             </View>
 
             {/* Proximity Category Pill */}
             <View style={s.proximityPillRow}>
-              {focusedDevice.distance !== null && (
+              {focusedDevice.distance !== undefined && focusedDevice.distance !== null && (
                 <View style={[
                   s.proximityPill,
                   focusedDevice.distance < 1.5 ? s.pillClose : (focusedDevice.distance < 4.0 ? s.pillMedium : s.pillFar)
@@ -443,7 +437,7 @@ export default function BleScannerSection() {
           <View style={s.signalMetricsRow}>
             <View style={s.signalMetricBox}>
               <Text style={s.signalMetricLabel}>1€ FILTERED RSSI</Text>
-              <Text style={s.signalMetricVal}>{focusedDevice.filteredRssi !== null ? `${focusedDevice.filteredRssi}` : "--"} <Text style={s.heroUnit}>dBm</Text></Text>
+              <Text style={s.signalMetricVal}>{focusedDevice.filteredRssi !== undefined && focusedDevice.filteredRssi !== null ? `${focusedDevice.filteredRssi}` : "--"} <Text style={s.heroUnit}>dBm</Text></Text>
             </View>
             <View style={s.signalMetricBox}>
               <Text style={s.signalMetricLabel}>RAW PACKET RSSI</Text>
@@ -461,7 +455,7 @@ export default function BleScannerSection() {
               <View style={s.sparklineHeader}>
                 <Text style={s.sparklineTitle}>Live Distance Trail (Last 20 Points)</Text>
                 <Text style={s.sparklineSub}>
-                  Latest: {focusedDevice.distance}m • Target: {focusedDevice.targetDistance || "--"}m
+                  Latest: {focusedDevice.distance || "--"}m • Target: {focusedDevice.targetDistance || "--"}m
                 </Text>
               </View>
               <DistanceSparkline history={focusedDevice.distanceHistory} />
@@ -662,7 +656,8 @@ export default function BleScannerSection() {
 function DistanceSparkline({ history }) {
   if (!history || history.length < 2) return null;
 
-  const width = Math.min(Dimensions?.get?.("window")?.width || 340, 360) - 56;
+  const screenWidth = Dimensions.get("window").width;
+  const width = Math.max(260, Math.min(screenWidth - 56, 360));
   const height = 65;
   const pad = 8;
 
