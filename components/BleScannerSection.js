@@ -173,7 +173,7 @@ export default function BleScannerSection() {
         simIntervalRef.current = setInterval(() => {
           simTick++;
           simNodesStream(simulatedNodes, simTick);
-        }, 150);
+        }, 75);
 
         return;
       }
@@ -193,10 +193,10 @@ export default function BleScannerSection() {
       setIsScanning(true);
       isScanningRef.current = true;
 
-      // Start continuous scanning with duplicate packets allowed for high-frequency RSSI stream
+      // Start continuous scanning with duplicate packets allowed and LowLatency mode (scanMode: 2) for zero hardware scan delay
       mgr.startDeviceScan(
         null,
-        { allowDuplicates: true },
+        { allowDuplicates: true, scanMode: 2 },
         (error, scannedDevice) => {
           if (error) {
             console.warn("BLE Scan Error:", error);

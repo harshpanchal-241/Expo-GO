@@ -1,16 +1,16 @@
 // ============================================================================
-// USER CONFIGURABLE PARAMETERS (Tune for indoor/outdoor/crowded BLE)
+// USER CONFIGURABLE PARAMETERS (Optimized for Ultra-Low Latency & Fast Response)
 // ============================================================================
-export const INITIAL_SAMPLE_SIZE = 3;       // Number of RSSI packets for fast initial lock
+export const INITIAL_SAMPLE_SIZE = 2;       // Instant fast lock (1-2 packets)
 export const MEDIAN_WINDOW = 3;             // Rolling median filter size
-export const UI_UPDATE_INTERVAL_MS = 100;   // UI refresh rate (in ms)
-export const STATIONARY_STEP_LIMIT = 0.25;  // Max distance change (m) per update when stable (0.2–0.3)
-export const MOVING_STEP_LIMIT = 0.85;      // Max distance change (m) per update when moving (0.7–1.0)
-export const DEAD_ZONE = 0.20;              // Ignore tiny fluctuations (m) when stationary (0.15–0.25)
-export const APPROACH_SENSITIVITY = 1.2;    // How fast it reacts when getting closer (> 1.0 is faster)
-export const AWAY_SENSITIVITY = 1.0;        // How fast it reacts when moving away
-export const ONE_EURO_MIN_CUTOFF = 1.0;     // One-Euro smoothing baseline frequency (fc_min in Hz)
-export const ONE_EURO_BETA = 0.05;          // One-Euro responsiveness speed coefficient
+export const UI_UPDATE_INTERVAL_MS = 50;    // UI refresh rate in ms (20 FPS for silky response)
+export const STATIONARY_STEP_LIMIT = 0.50;  // Max distance change (m) per update when stable
+export const MOVING_STEP_LIMIT = 2.00;      // Max distance change (m) per update when moving
+export const DEAD_ZONE = 0.12;              // Ignore tiny noise fluctuations (m) when stationary
+export const APPROACH_SENSITIVITY = 1.4;    // High-speed reaction multiplier when getting closer
+export const AWAY_SENSITIVITY = 1.2;        // High-speed reaction multiplier when moving away
+export const ONE_EURO_MIN_CUTOFF = 1.2;     // Baseline frequency in Hz (smooth when stationary)
+export const ONE_EURO_BETA = 0.45;          // Responsiveness factor (zero lag when moving)
 export const DEFAULT_TX_POWER = -59;        // Measured RSSI at 1 meter (dBm)
 export const DEFAULT_ENV_N = 2.2;           // Path loss exponent for indoor environment
 // ============================================================================
@@ -175,24 +175,29 @@ export class DeviceDistanceTracker {
     this.lastPacketTime = timestamp;
 
     // ------------------------------------------------------------------------
-    // PHASE 1: Fast Lock Mode (Initial Sample Collection)
+    // PHASE 1: Fast Initial Lock (Show instant estimate on packet #1 & #2)
     // ------------------------------------------------------------------------
     if (!this.isLocked) {
       this.initialSamples.push(rawRssi);
       this.rollingWindow.push(rawRssi);
 
-      if (this.initialSamples.length >= INITIAL_SAMPLE_SIZE) {
-        // Fast lock triggered on first INITIAL_SAMPLE_SIZE valid samples
-        const sorted = [...this.initialSamples].sort((a, b) => a - b);
-        const medianRssi = sorted[Math.floor(sorted.length / 2)];
-
-        this.filteredRssi = medianRssi;
-        this.oneEuro.filter(medianRssi, timestamp);
-
-        const initDist = this.rssiToDistance(medianRssi);
-        this.targetDistance = initDist;
+      const initDist = this.rssiToDistance(rawRssi);
+      this.targetDistance = initDist;
+      if (this.currentDistance === null) {
         this.currentDistance = initDist;
         this.recentDistances = [initDist];
+      }
+      this.filteredRssi = rawRssi;
+
+      if (this.initialSamples.length >= INITIAL_SAMPLE_SIZE) {
+        const sorted = [...this.initialSamples].sort((a, b) => a - b);
+        const medianRssi = sorted[Math.floor(sorted.length / 2)];
+        this.filteredRssi = medianRssi;
+        this.oneEuro.filter(medianRssi, timestamp);
+        const refinedDist = this.rssiToDistance(medianRssi);
+        this.targetDistance = refinedDist;
+        this.currentDistance = refinedDist;
+        this.recentDistances = [refinedDist];
         this.isLocked = true;
       }
       return;
@@ -215,13 +220,13 @@ export class DeviceDistanceTracker {
 
     if (this.trend === "approaching") {
       beta *= APPROACH_SENSITIVITY;
-      minCutoff *= 1.4; // Less smoothing when moving closer for instant reaction
+      minCutoff *= 1.8; // Open up cutoff frequency for instantaneous approach tracking
     } else if (this.trend === "moving_away") {
       beta *= AWAY_SENSITIVITY;
-      minCutoff *= 1.2;
+      minCutoff *= 1.5;
     } else {
-      // Stationary: increase smoothing to prevent jitter
-      minCutoff *= 0.7;
+      // Stationary: high stability
+      minCutoff *= 0.8;
     }
 
     this.filteredRssi = this.oneEuro.filter(medianWindowRssi, timestamp, beta, minCutoff);
@@ -234,11 +239,11 @@ export class DeviceDistanceTracker {
   updateTrend(newTargetDist) {
     if (newTargetDist === null) return;
     this.recentDistances.push(newTargetDist);
-    if (this.recentDistances.length > 5) {
+    if (this.recentDistances.length > 4) {
       this.recentDistances.shift();
     }
 
-    if (this.recentDistances.length < 3) {
+    if (this.recentDistances.length < 2) {
       this.trend = "stationary";
       return;
     }
@@ -247,9 +252,9 @@ export class DeviceDistanceTracker {
     const last = this.recentDistances[this.recentDistances.length - 1];
     const diff = last - first;
 
-    if (diff < -0.25) {
+    if (diff < -0.20) {
       this.trend = "approaching";
-    } else if (diff > 0.30) {
+    } else if (diff > 0.25) {
       this.trend = "moving_away";
     } else {
       this.trend = "stationary";
@@ -257,7 +262,7 @@ export class DeviceDistanceTracker {
   }
 
   // --------------------------------------------------------------------------
-  // Adaptive Rate Limiter & Dead Zone Step
+  // Dynamic Rate Limiter & Dead Zone Step (Smooth & Zero Lag)
   // --------------------------------------------------------------------------
   stepDistance() {
     if (this.targetDistance === null) return null;
@@ -269,7 +274,7 @@ export class DeviceDistanceTracker {
     const diff = this.targetDistance - this.currentDistance;
     const absDiff = Math.abs(diff);
 
-    // Dead Zone: ignore tiny fluctuations when stationary
+    // Dead Zone: ignore microscopic noise jitter when stationary
     if (this.trend === "stationary" && absDiff < DEAD_ZONE) {
       return Number(this.currentDistance.toFixed(2));
     }
@@ -284,8 +289,9 @@ export class DeviceDistanceTracker {
       stepLimit = STATIONARY_STEP_LIMIT;
     }
 
-    // Apply rate limit clamp to prevent wild jumps (e.g., 2m -> 8m -> 3m)
-    const step = Math.sign(diff) * Math.min(absDiff, stepLimit);
+    // Proportional dynamic step: closes 50% of gap or stepLimit per tick (fast convergence without spikes)
+    const dynamicStep = Math.max(stepLimit, absDiff * 0.50);
+    const step = Math.sign(diff) * Math.min(absDiff, dynamicStep);
     this.currentDistance += step;
 
     return Number(this.currentDistance.toFixed(2));
