@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "PDR Test",
+    "slug": "pdr-test",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": {
+      "permissions": [
+        "ACTIVITY_RECOGNITION",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMotionUsageDescription": "This app requires access to Motion and Fitness sensors for Pedestrian Dead Reckoning indoor navigation step tracking.",
+        "NSBluetoothAlwaysUsageDescription": "This app requires Bluetooth access to scan nearby BLE beacons and estimate indoor distance.",
+        "NSBluetoothPeripheralUsageDescription": "This app requires Bluetooth access to scan nearby BLE devices."
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "92edba85-a87b-4167-ae17-a6ba192ef884"
+      }
+    }
+  }
+}
