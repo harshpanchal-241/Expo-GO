@@ -294,7 +294,16 @@ export class DeviceDistanceTracker {
     const step = Math.sign(diff) * Math.min(absDiff, dynamicStep);
     this.currentDistance += step;
 
-    return Number(this.currentDistance.toFixed(2));
+    const roundedDist = Number(this.currentDistance.toFixed(2));
+    
+    // Maintain distance history for live chart (last 20 points)
+    if (!this.distanceHistory) this.distanceHistory = [];
+    this.distanceHistory.push(roundedDist);
+    if (this.distanceHistory.length > 20) {
+      this.distanceHistory.shift();
+    }
+
+    return roundedDist;
   }
 
   getState() {
@@ -306,7 +315,8 @@ export class DeviceDistanceTracker {
       distance: this.currentDistance !== null ? Number(this.currentDistance.toFixed(2)) : null,
       targetDistance: this.targetDistance !== null ? Number(this.targetDistance.toFixed(2)) : null,
       trend: this.trend,
-      lastSeen: this.lastPacketTime
+      lastSeen: this.lastPacketTime,
+      distanceHistory: this.distanceHistory || []
     };
   }
 
@@ -314,6 +324,7 @@ export class DeviceDistanceTracker {
     this.initialSamples = [];
     this.rollingWindow = [];
     this.recentDistances = [];
+    this.distanceHistory = [];
     this.isLocked = false;
     this.oneEuro.reset();
     this.rawRssi = null;

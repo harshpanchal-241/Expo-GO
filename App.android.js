@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { SafeAreaView, View, Text, Pressable, ScrollView, StyleSheet, Alert, Dimensions } from "react-native";
+import { SafeAreaView, View, Text, Pressable, ScrollView, StyleSheet, Alert, Dimensions, PermissionsAndroid, Platform } from "react-native";
 import Svg, { Polyline, Circle, Line, Text as SvgText } from "react-native-svg";
 import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-sensors";
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
@@ -88,10 +88,33 @@ export default function AppAndroid() {
     return Number(Math.min(1.1, Math.max(0.45, estimatedLen)).toFixed(2));
   };
 
+  const magFieldRef = useRef({ x: 0, y: 0, z: 0, total: 0 });
+  const gravityRef = useRef(1.0);
+
+  // --------------------------------------------------------------------------
+  // Throttled UI State Sync Loop (100ms) - Prevents 35+ full React rerenders/sec!
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    const uiSyncTimer = setInterval(() => {
+      setHeading(headingRef.current);
+      setMagneticField(magFieldRef.current);
+    }, 100);
+    return () => clearInterval(uiSyncTimer);
+  }, []);
+
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
     (async () => {
       try {
+        // Request Android Activity Recognition runtime permission for hardware pedometer
+        if (Platform.OS === "android" && Platform.Version >= 29) {
+          try {
+            await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACTIVITY_RECOGNITION);
+          } catch (pe) {
+            console.warn("Activity recognition permission error:", pe);
+          }
+        }
+
         const pAvail = await Pedometer.isAvailableAsync();
         const mAvail = await DeviceMotion.isAvailableAsync();
         const magAvail = await Magnetometer.isAvailableAsync();
@@ -105,12 +128,12 @@ export default function AppAndroid() {
         magSub = Magnetometer.addListener(data => {
           const { x, y, z } = data;
           const totalField = Math.sqrt(x * x + y * y + z * z);
-          setMagneticField({
+          magFieldRef.current = {
             x: Number(x.toFixed(1)),
             y: Number(y.toFixed(1)),
             z: Number(z.toFixed(1)),
             total: Number(totalField.toFixed(1))
-          });
+          };
         });
 
         DeviceMotion.setUpdateInterval(40);
@@ -128,10 +151,10 @@ export default function AppAndroid() {
             smoothedHeadingRef.current = norm(smoothedHeadingRef.current + LPF_ALPHA * diff);
             const formattedHeading = signed(smoothedHeadingRef.current);
             headingRef.current = formattedHeading;
-            setHeading(formattedHeading);
           }
         });
 
+        // Hardware Pedometer Listener
         pedSub = Pedometer.watchStepCount(result => {
           const current = result.steps || 0;
           if (!initializedPedRef.current) {
@@ -142,11 +165,13 @@ export default function AppAndroid() {
           const prev = prevPedRef.current;
           if (runningRef.current && current > prev) {
             const autoLen = computeWeinbergStepLength();
-            for (let i = 0; i < current - prev; i++) addStep(autoLen);
+            const stepDelta = Math.min(5, current - prev); // prevent batch burst jumps
+            for (let i = 0; i < stepDelta; i++) addStep(autoLen);
           }
           prevPedRef.current = current;
         });
 
+        // High-Precision Peak-Valley Dynamic Accelerometer Step Detector
         Accelerometer.setUpdateInterval(40);
         accelSub = Accelerometer.addListener(data => {
           if (!runningRef.current) return;
@@ -154,8 +179,13 @@ export default function AppAndroid() {
           const mag = Math.sqrt(x * x + y * y + z * z);
           stepAccelBufferRef.current.push(mag);
 
+          // Update rolling gravity baseline
+          gravityRef.current = 0.96 * gravityRef.current + 0.04 * mag;
+          const dynamicAccel = Math.abs(mag - gravityRef.current);
+
           const now = Date.now();
-          if (mag > ACCEL_THRESHOLD && (now - lastStepTimeRef.current) > ACCEL_MIN_DELAY) {
+          // Detect step peaks above dynamic threshold with refractory lockout
+          if (dynamicAccel > 0.22 && (now - lastStepTimeRef.current) > ACCEL_MIN_DELAY) {
             if (!pAvail || !initializedPedRef.current) {
               lastStepTimeRef.current = now;
               const autoLen = computeWeinbergStepLength();

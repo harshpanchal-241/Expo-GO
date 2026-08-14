@@ -9,6 +9,7 @@ import {
   Alert,
   Switch
 } from "react-native";
+import Svg, { Polyline, Circle, Line, Rect } from "react-native-svg";
 import {
   getBleManager,
   getSignalQuality,
@@ -44,6 +45,9 @@ export default function BleScannerSection() {
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [updateStatusText, setUpdateStatusText] = useState("");
 
+  // Single Focused Device for Dedicated Testing
+  const [focusedDeviceId, setFocusedDeviceId] = useState(null);
+
   const isScanningRef = useRef(false);
   const simIntervalRef = useRef(null);
   const managerRef = useRef(null);
@@ -60,7 +64,7 @@ export default function BleScannerSection() {
   }, [txPower1m, environmentalN]);
 
   // --------------------------------------------------------------------------
-  // Independent UI Rendering Loop (UI_UPDATE_INTERVAL_MS = 100ms)
+  // Independent UI Rendering Loop (UI_UPDATE_INTERVAL_MS = 50ms)
   // --------------------------------------------------------------------------
   useEffect(() => {
     const uiInterval = setInterval(() => {
@@ -193,7 +197,7 @@ export default function BleScannerSection() {
       setIsScanning(true);
       isScanningRef.current = true;
 
-      // Start continuous scanning with duplicate packets allowed and LowLatency mode (scanMode: 2) for zero hardware scan delay
+      // Start continuous scanning with duplicate packets allowed and LowLatency mode (scanMode: 2)
       mgr.startDeviceScan(
         null,
         { allowDuplicates: true, scanMode: 2 },
@@ -227,7 +231,6 @@ export default function BleScannerSection() {
   // Simulation packet generator for Expo Go
   const simNodesStream = (nodes, tick) => {
     nodes.forEach((node) => {
-      // Simulate real RF multipath noise (+/- 2 dBm) around dynamic movement
       const noise = (Math.sin(tick * 0.4 + node.baseRssi) * 2) + ((Math.random() - 0.5) * 1.5);
       const dynamicRssi = Math.round(node.baseRssi + (Math.sin(tick * 0.08) * 10 * Math.sign(node.velocity || 1)) + noise);
       const clampedRssi = Math.min(-42, Math.max(-98, dynamicRssi));
@@ -260,6 +263,15 @@ export default function BleScannerSection() {
     trackersRef.current.clear();
     deviceMetaRef.current.clear();
     setDevices({});
+    setFocusedDeviceId(null);
+  };
+
+  const handleResetFocusedFilter = () => {
+    if (!focusedDeviceId) return;
+    const tracker = trackersRef.current.get(focusedDeviceId);
+    if (tracker) {
+      tracker.reset();
+    }
   };
 
   const handleCheckForUpdate = async () => {
@@ -272,7 +284,7 @@ export default function BleScannerSection() {
       setIsCheckingUpdate(true);
       setUpdateStatusText("Checking for latest OTA update...");
       const check = await Updates.checkForUpdateAsync();
-      
+
       if (check.isAvailable) {
         setUpdateStatusText("Downloading new update...");
         await Updates.fetchUpdateAsync();
@@ -312,20 +324,24 @@ export default function BleScannerSection() {
       return a.distance - b.distance;
     });
 
+  const focusedDevice = focusedDeviceId ? devices[focusedDeviceId] : null;
+
   return (
     <View style={s.card}>
       {/* Header */}
       <View style={s.headerRow}>
         <View style={{ flex: 1 }}>
-          <Text style={s.sectionTitle}>Fast & Smooth BLE Distance</Text>
+          <Text style={s.sectionTitle}>
+            {focusedDevice ? "🎯 Focused Target Testing" : "Fast & Smooth BLE Distance"}
+          </Text>
           <Text style={s.subText}>
-            Bluetooth: <Text style={{ fontWeight: "700", color: bluetoothStatus === "PoweredOn" ? "#1a7f37" : "#cf222e" }}>{bluetoothStatus}</Text>
+            Bluetooth: <Text style={{ fontWeight: "700", color: bluetoothStatus === "PoweredOn" ? "#1a7f37" : "#cf222e" }}>{bluetoothStatus}</Text> • 50ms Low-Latency
           </Text>
         </View>
         {isScanning && (
           <View style={s.scanningBadge}>
             <ActivityIndicator size="small" color="#1f6feb" />
-            <Text style={s.scanningText}>Live Tracking</Text>
+            <Text style={s.scanningText}>Live 20 FPS</Text>
           </View>
         )}
       </View>
@@ -348,149 +364,272 @@ export default function BleScannerSection() {
         </Pressable>
       </View>
 
-      {/* Pipeline Config & Tuning Indicators */}
-      <View style={s.filterRow}>
-        <View style={s.switchItem}>
-          <Text style={s.filterLabel}>Named Only</Text>
-          <Switch
-            value={filterNamedOnly}
-            onValueChange={setFilterNamedOnly}
-            trackColor={{ false: "#d0d7de", true: "#80ccff" }}
-            thumbColor={filterNamedOnly ? "#1f6feb" : "#f6f8fa"}
-          />
-        </View>
-        <View style={s.paramBadge}>
-          <Text style={s.paramText}>Lock: {INITIAL_SAMPLE_SIZE} pkts | 1€-Filter | 100ms UI</Text>
-        </View>
-      </View>
+      {/* ==================================================================== */}
+      {/* VIEW MODE A: FOCUSED SINGLE DEVICE TESTING DASHBOARD */}
+      {/* ==================================================================== */}
+      {focusedDevice ? (
+        <View style={s.focusedContainer}>
+          {/* Back to All Devices Navigation Button */}
+          <View style={s.focusedNavRow}>
+            <Pressable
+              onPress={() => setFocusedDeviceId(null)}
+              style={s.backBtn}
+            >
+              <Text style={s.backBtnText}>⬅️ Back to All Devices</Text>
+            </Pressable>
+            <Pressable
+              onPress={handleResetFocusedFilter}
+              style={s.resetFilterBtn}
+            >
+              <Text style={s.resetFilterText}>🔄 Re-Lock Filter</Text>
+            </Pressable>
+          </View>
 
-      {/* Device Count Summary */}
-      <View style={s.summaryBar}>
-        <Text style={s.summaryText}>
-          Tracking: <Text style={{ fontWeight: "800", color: "#24292f" }}>{deviceList.length}</Text> BLE device{deviceList.length === 1 ? "" : "s"}
-        </Text>
-        <Text style={s.summaryHint}>Sorted by Proximity (Nearest first)</Text>
-      </View>
-
-      {/* Device Cards List */}
-      {deviceList.length === 0 ? (
-        <View style={s.emptyBox}>
-          <Text style={s.emptyTitle}>
-            {isScanning ? "Waiting for initial BLE packets..." : "Scanner is currently idle"}
-          </Text>
-          <Text style={s.emptySub}>
-            {isScanning
-              ? `Fast Lock will calculate initial distance on the first ${INITIAL_SAMPLE_SIZE} RSSI samples.`
-              : "Tap 'Start BLE Scan' above to begin low-latency filtered distance tracking."}
-          </Text>
-        </View>
-      ) : (
-        <ScrollView style={s.deviceScroll} nestedScrollEnabled>
-          {deviceList.map((device) => {
-            const rawRssi = device.rawRssi || device.filteredRssi || -100;
-            const quality = getSignalQuality(rawRssi);
-            const isNamed = !!device.name;
-
-            // Movement trend style helper
-            let trendLabel = "Stationary";
-            let trendColor = "#57606a";
-            let trendBg = "#f6f8fa";
-            let trendIcon = "⚪";
-
-            if (device.trend === "approaching") {
-              trendLabel = "Approaching";
-              trendColor = "#1a7f37";
-              trendBg = "#dafbe1";
-              trendIcon = "🟢";
-            } else if (device.trend === "moving_away") {
-              trendLabel = "Moving Away";
-              trendColor = "#d29922";
-              trendBg = "#fff8c5";
-              trendIcon = "🟠";
-            }
-
-            return (
-              <View key={device.id} style={s.deviceCard}>
-                {/* Header: Name + Badges */}
-                <View style={s.deviceHeader}>
-                  <View style={{ flex: 1, marginRight: 8 }}>
-                    <Text style={[s.deviceName, !isNamed && s.unnamedDevice]}>
-                      {device.name || "Unknown BLE Beacon"}
-                    </Text>
-                    <Text style={s.deviceId}>ID: {device.id}</Text>
-                  </View>
-
-                  <View style={{ alignItems: "flex-end", gap: 4 }}>
-                    {device.isLocked ? (
-                      <View style={s.lockedBadge}>
-                        <Text style={s.lockedText}>⚡ Fast Locked</Text>
-                      </View>
-                    ) : (
-                      <View style={s.lockingBadge}>
-                        <Text style={s.lockingText}>
-                          Locking ({device.sampleCount || 0}/{INITIAL_SAMPLE_SIZE})
-                        </Text>
-                      </View>
-                    )}
-
-                    <View style={[s.trendBadge, { backgroundColor: trendBg, borderColor: trendColor }]}>
-                      <Text style={[s.trendText, { color: trendColor }]}>
-                        {trendIcon} {trendLabel}
-                      </Text>
-                    </View>
-                  </View>
+          {/* Focused Device Header */}
+          <View style={s.focusedHeaderCard}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.focusedName}>{focusedDevice.name || "Unnamed Target Beacon"}</Text>
+              <Text style={s.focusedId}>UUID / MAC: {focusedDevice.id}</Text>
+            </View>
+            <View style={s.focusedStatusGroup}>
+              {focusedDevice.isLocked ? (
+                <View style={s.lockedBadge}>
+                  <Text style={s.lockedText}>⚡ Fast Locked</Text>
                 </View>
-
-                {/* Primary Metric Hero: Smooth Distance */}
-                <View style={s.heroMetricBox}>
-                  <View style={s.heroLeft}>
-                    <Text style={s.heroLabel}>ESTIMATED DISTANCE</Text>
-                    <Text style={s.heroValue}>
-                      {device.distance !== null ? `${device.distance}` : "--"}
-                      <Text style={s.heroUnit}> meters</Text>
-                    </Text>
-                  </View>
-
-                  <View style={s.heroDivider} />
-
-                  <View style={s.heroRight}>
-                    <Text style={s.heroLabel}>SIGNAL (1€ FILTERED)</Text>
-                    <Text style={[s.rssiValue, { color: quality.color }]}>
-                      {device.filteredRssi !== null ? device.filteredRssi : rawRssi}{" "}
-                      <Text style={s.heroUnit}>dBm</Text>
-                    </Text>
-                    <Text style={s.rawRssiSub}>Raw: {device.rawRssi || "--"} dBm</Text>
-                  </View>
+              ) : (
+                <View style={s.lockingBadge}>
+                  <Text style={s.lockingText}>Locking ({focusedDevice.sampleCount || 0}/{INITIAL_SAMPLE_SIZE})</Text>
                 </View>
+              )}
+            </View>
+          </View>
 
-                {/* Signal Bar */}
-                <View style={s.barContainer}>
-                  <View
-                    style={[
-                      s.barFill,
-                      {
-                        width: `${quality.percentage}%`,
-                        backgroundColor: quality.color
-                      }
-                    ]}
-                  />
-                </View>
+          {/* Big Hero Distance Display */}
+          <View style={s.focusedHeroBox}>
+            <Text style={s.focusedHeroTitle}>ESTIMATED PHYSICAL DISTANCE</Text>
+            <View style={s.focusedDistanceRow}>
+              <Text style={s.focusedDistanceNumber}>
+                {focusedDevice.distance !== null ? `${focusedDevice.distance}` : "--"}
+              </Text>
+              <Text style={s.focusedDistanceUnit}>meters</Text>
+            </View>
 
-                {/* Footer Info */}
-                <View style={s.deviceFooter}>
-                  <Text style={s.footerText}>
-                    Last packet: {Math.max(0, Math.round((Date.now() - (device.lastSeen || Date.now())) / 1000))}s ago
+            {/* Proximity Category Pill */}
+            <View style={s.proximityPillRow}>
+              {focusedDevice.distance !== null && (
+                <View style={[
+                  s.proximityPill,
+                  focusedDevice.distance < 1.5 ? s.pillClose : (focusedDevice.distance < 4.0 ? s.pillMedium : s.pillFar)
+                ]}>
+                  <Text style={s.proximityPillText}>
+                    {focusedDevice.distance < 1.5 ? "📍 Immediate Proximity (< 1.5m)" : (focusedDevice.distance < 4.0 ? "🚶 Room Range (1.5 - 4.0m)" : "📡 Distant Beacon (> 4.0m)")}
                   </Text>
-                  {device.targetDistance !== null && (
-                    <Text style={s.footerText}>
-                      Target: ~{device.targetDistance}m • {quality.label}
-                    </Text>
-                  )}
+                </View>
+              )}
+
+              {/* Movement Trend Indicator */}
+              <View style={[
+                s.trendBadge,
+                focusedDevice.trend === "approaching" ? s.trendApproaching : (focusedDevice.trend === "moving_away" ? s.trendAway : s.trendStationary)
+              ]}>
+                <Text style={s.trendText}>
+                  {focusedDevice.trend === "approaching" ? "🟢 Approaching (Moving Closer)" : (focusedDevice.trend === "moving_away" ? "🟠 Moving Away" : "⚪ Stationary (Stable)")}
+                </Text>
+              </View>
+            </View>
+          </View>
+
+          {/* Signal Metrics Dual Box */}
+          <View style={s.signalMetricsRow}>
+            <View style={s.signalMetricBox}>
+              <Text style={s.signalMetricLabel}>1€ FILTERED RSSI</Text>
+              <Text style={s.signalMetricVal}>{focusedDevice.filteredRssi !== null ? `${focusedDevice.filteredRssi}` : "--"} <Text style={s.heroUnit}>dBm</Text></Text>
+            </View>
+            <View style={s.signalMetricBox}>
+              <Text style={s.signalMetricLabel}>RAW PACKET RSSI</Text>
+              <Text style={s.signalMetricVal}>{focusedDevice.rawRssi || "--"} <Text style={s.heroUnit}>dBm</Text></Text>
+            </View>
+            <View style={s.signalMetricBox}>
+              <Text style={s.signalMetricLabel}>STREAM RATE</Text>
+              <Text style={[s.signalMetricVal, { color: "#1a7f37" }]}>~20 FPS</Text>
+            </View>
+          </View>
+
+          {/* Live Distance History Sparkline Graph */}
+          {focusedDevice.distanceHistory && focusedDevice.distanceHistory.length > 1 && (
+            <View style={s.sparklineCard}>
+              <View style={s.sparklineHeader}>
+                <Text style={s.sparklineTitle}>Live Distance Trail (Last 20 Points)</Text>
+                <Text style={s.sparklineSub}>
+                  Latest: {focusedDevice.distance}m • Target: {focusedDevice.targetDistance || "--"}m
+                </Text>
+              </View>
+              <DistanceSparkline history={focusedDevice.distanceHistory} />
+            </View>
+          )}
+
+          {/* Real-time Beacon Calibration Controls */}
+          <View style={s.calibrationCard}>
+            <Text style={s.calibrationTitle}>Real-time Beacon Calibration</Text>
+            <View style={s.calibControlsRow}>
+              {/* TxPower Adjuster */}
+              <View style={s.calibItem}>
+                <Text style={s.calibLabel}>TxPower@1m: {txPower1m} dBm</Text>
+                <View style={s.plusMinusRow}>
+                  <Pressable onPress={() => setTxPower1m(p => p - 1)} style={s.calibBtn}><Text style={s.calibBtnText}>-1</Text></Pressable>
+                  <Pressable onPress={() => setTxPower1m(p => p + 1)} style={s.calibBtn}><Text style={s.calibBtnText}>+1</Text></Pressable>
                 </View>
               </View>
-            );
-          })}
-        </ScrollView>
+
+              {/* Environmental N Adjuster */}
+              <View style={s.calibItem}>
+                <Text style={s.calibLabel}>Path Loss (n): {environmentalN.toFixed(1)}</Text>
+                <View style={s.plusMinusRow}>
+                  <Pressable onPress={() => setEnvironmentalN(n => Number(Math.max(1.5, n - 0.1).toFixed(1)))} style={s.calibBtn}><Text style={s.calibBtnText}>-0.1</Text></Pressable>
+                  <Pressable onPress={() => setEnvironmentalN(n => Number(Math.min(4.0, n + 0.1).toFixed(1)))} style={s.calibBtn}><Text style={s.calibBtnText}>+0.1</Text></Pressable>
+                </View>
+              </View>
+            </View>
+          </View>
+        </View>
+      ) : (
+        /* ==================================================================== */
+        /* VIEW MODE B: ALL DISCOVERED DEVICES LIST */
+        /* ==================================================================== */
+        <>
+          {/* Pipeline Config & Tuning Indicators */}
+          <View style={s.filterRow}>
+            <View style={s.switchItem}>
+              <Text style={s.filterLabel}>Named Only</Text>
+              <Switch
+                value={filterNamedOnly}
+                onValueChange={setFilterNamedOnly}
+                trackColor={{ false: "#d0d7de", true: "#80ccff" }}
+                thumbColor={filterNamedOnly ? "#1f6feb" : "#f6f8fa"}
+              />
+            </View>
+            <View style={s.paramBadge}>
+              <Text style={s.paramText}>Lock: {INITIAL_SAMPLE_SIZE} pkts | 1€-Filter | 50ms UI</Text>
+            </View>
+          </View>
+
+          {/* Device Count Summary */}
+          <View style={s.summaryBar}>
+            <Text style={s.summaryText}>
+              Tracking: <Text style={{ fontWeight: "800", color: "#24292f" }}>{deviceList.length}</Text> BLE device{deviceList.length === 1 ? "" : "s"}
+            </Text>
+            <Text style={s.summaryHint}>Tap "Focus" to isolate 1 device</Text>
+          </View>
+
+          {/* Device Cards List */}
+          {deviceList.length === 0 ? (
+            <View style={s.emptyBox}>
+              <Text style={s.emptyTitle}>
+                {isScanning ? "Scanning with LowLatency hardware mode..." : "Scanner is currently idle"}
+              </Text>
+              <Text style={s.emptySub}>
+                {isScanning
+                  ? "Instant lock will display physical distance on packet #1."
+                  : "Tap 'Start BLE Scan' above to detect nearby beacons."}
+              </Text>
+            </View>
+          ) : (
+            <ScrollView style={s.deviceScroll} nestedScrollEnabled>
+              {deviceList.map((device) => {
+                const rawRssi = device.rawRssi || device.filteredRssi || -100;
+                const quality = getSignalQuality(rawRssi);
+                const isNamed = !!device.name;
+
+                let trendLabel = "Stationary";
+                let trendColor = "#57606a";
+                let trendBg = "#f6f8fa";
+                let trendIcon = "⚪";
+
+                if (device.trend === "approaching") {
+                  trendLabel = "Approaching";
+                  trendColor = "#1a7f37";
+                  trendBg = "#dafbe1";
+                  trendIcon = "🟢";
+                } else if (device.trend === "moving_away") {
+                  trendLabel = "Moving Away";
+                  trendColor = "#d29922";
+                  trendBg = "#fff8c5";
+                  trendIcon = "🟠";
+                }
+
+                return (
+                  <View key={device.id} style={s.deviceCard}>
+                    {/* Header: Name + Badges */}
+                    <View style={s.deviceHeader}>
+                      <View style={{ flex: 1, marginRight: 8 }}>
+                        <Text style={[s.deviceName, !isNamed && s.unnamedDevice]}>
+                          {device.name || "Unknown BLE Beacon"}
+                        </Text>
+                        <Text style={s.deviceId}>ID: {device.id}</Text>
+                      </View>
+
+                      <View style={{ alignItems: "flex-end", gap: 4 }}>
+                        <View style={[s.trendBadge, { backgroundColor: trendBg, borderColor: trendColor }]}>
+                          <Text style={[s.trendText, { color: trendColor }]}>
+                            {trendIcon} {trendLabel}
+                          </Text>
+                        </View>
+                      </View>
+                    </View>
+
+                    {/* Primary Metric Hero: Smooth Distance */}
+                    <View style={s.heroMetricBox}>
+                      <View style={s.heroLeft}>
+                        <Text style={s.heroLabel}>ESTIMATED DISTANCE</Text>
+                        <Text style={s.heroValue}>
+                          {device.distance !== null ? `${device.distance}` : "--"}
+                          <Text style={s.heroUnit}> meters</Text>
+                        </Text>
+                      </View>
+
+                      <View style={s.heroDivider} />
+
+                      <View style={s.heroRight}>
+                        <Text style={s.heroLabel}>SIGNAL (1€ FILTERED)</Text>
+                        <Text style={[s.rssiValue, { color: quality.color }]}>
+                          {device.filteredRssi !== null ? device.filteredRssi : rawRssi}{" "}
+                          <Text style={s.heroUnit}>dBm</Text>
+                        </Text>
+                        <Text style={s.rawRssiSub}>Raw: {device.rawRssi || "--"} dBm</Text>
+                      </View>
+                    </View>
+
+                    {/* Signal Bar */}
+                    <View style={s.barContainer}>
+                      <View
+                        style={[
+                          s.barFill,
+                          {
+                            width: `${quality.percentage}%`,
+                            backgroundColor: quality.color
+                          }
+                        ]}
+                      />
+                    </View>
+
+                    {/* Footer Row + Focus Test Button */}
+                    <View style={s.deviceFooter}>
+                      <Text style={s.footerText}>
+                        Last packet: {Math.max(0, Math.round((Date.now() - (device.lastSeen || Date.now())) / 1000))}s ago
+                      </Text>
+                      <Pressable
+                        onPress={() => setFocusedDeviceId(device.id)}
+                        style={s.focusSelectBtn}
+                      >
+                        <Text style={s.focusSelectBtnText}>🎯 Focus & Test Device</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+          )}
+        </>
       )}
 
       {/* OTA Update Checker Card */}
@@ -513,6 +652,56 @@ export default function BleScannerSection() {
           )}
         </Pressable>
       </View>
+    </View>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Live Distance Sparkline Mini Chart Component
+// ----------------------------------------------------------------------------
+function DistanceSparkline({ history }) {
+  if (!history || history.length < 2) return null;
+
+  const width = Math.min(Dimensions?.get?.("window")?.width || 340, 360) - 56;
+  const height = 65;
+  const pad = 8;
+
+  const minVal = Math.max(0, Math.min(...history) - 0.3);
+  const maxVal = Math.max(...history) + 0.5;
+  const span = Math.max(1, maxVal - minVal);
+
+  const stepX = (width - pad * 2) / (history.length - 1);
+  const points = history.map((val, idx) => {
+    const x = pad + idx * stepX;
+    const y = height - pad - ((val - minVal) / span) * (height - pad * 2);
+    return { x, y, val };
+  });
+
+  const polyPoints = points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const latestPt = points[points.length - 1];
+
+  return (
+    <View style={{ alignItems: "center", marginVertical: 4 }}>
+      <Svg width={width} height={height}>
+        {/* Baseline grid */}
+        <Line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#e1e4e8" strokeDasharray="3,3" />
+        <Line x1={pad} y1={pad} x2={width - pad} y2={pad} stroke="#e1e4e8" strokeDasharray="3,3" />
+
+        {/* Trail Polyline */}
+        <Polyline
+          points={polyPoints}
+          fill="none"
+          stroke="#1f6feb"
+          strokeWidth="3"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+
+        {/* Highlight latest point */}
+        {latestPt && (
+          <Circle cx={latestPt.x} cy={latestPt.y} r="5" fill="#1f6feb" stroke="#ffffff" strokeWidth="2" />
+        )}
+      </Svg>
     </View>
   );
 }
@@ -551,7 +740,7 @@ const s = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
-    backgroundColor: "#ddf4ff",
+    backgroundColor: "#dafbe1",
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 12,
@@ -559,7 +748,7 @@ const s = StyleSheet.create({
   scanningText: {
     fontSize: 11,
     fontWeight: "700",
-    color: "#0969da",
+    color: "#1a7f37",
   },
   btnRow: {
     flexDirection: "row",
@@ -645,8 +834,8 @@ const s = StyleSheet.create({
   },
   summaryHint: {
     fontSize: 11,
-    color: "#8c959f",
-    fontStyle: "italic",
+    color: "#0969da",
+    fontWeight: "600",
   },
   emptyBox: {
     paddingVertical: 24,
@@ -732,14 +921,26 @@ const s = StyleSheet.create({
     color: "#9a6700",
   },
   trendBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
     borderRadius: 6,
     borderWidth: 1,
   },
   trendText: {
     fontSize: 10,
     fontWeight: "700",
+  },
+  trendApproaching: {
+    backgroundColor: "#dafbe1",
+    borderColor: "#1a7f37",
+  },
+  trendAway: {
+    backgroundColor: "#fff8c5",
+    borderColor: "#d29922",
+  },
+  trendStationary: {
+    backgroundColor: "#f6f8fa",
+    borderColor: "#d0d7de",
   },
   heroMetricBox: {
     flexDirection: "row",
@@ -811,6 +1012,247 @@ const s = StyleSheet.create({
     fontSize: 10,
     color: "#8c959f",
   },
+  focusSelectBtn: {
+    backgroundColor: "#ddf4ff",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#54aeff",
+  },
+  focusSelectBtnText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#0969da",
+  },
+
+  // Focused Mode Specific Styles
+  focusedContainer: {
+    marginTop: 4,
+  },
+  focusedNavRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  backBtn: {
+    backgroundColor: "#f6f8fa",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+  },
+  backBtnText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1f6feb",
+  },
+  resetFilterBtn: {
+    backgroundColor: "#fff8c5",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d29922",
+  },
+  resetFilterText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#9a6700",
+  },
+  focusedHeaderCard: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#f6f8fa",
+    padding: 10,
+    borderRadius: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+  },
+  focusedName: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#24292f",
+  },
+  focusedId: {
+    fontSize: 10,
+    fontFamily: "monospace",
+    color: "#8c959f",
+    marginTop: 2,
+  },
+  focusedStatusGroup: {
+    alignItems: "flex-end",
+  },
+  focusedHeroBox: {
+    backgroundColor: "#ffffff",
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: "#1f6feb",
+    padding: 16,
+    alignItems: "center",
+    marginBottom: 10,
+    shadowColor: "#1f6feb",
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  focusedHeroTitle: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#57606a",
+    letterSpacing: 1,
+    marginBottom: 6,
+  },
+  focusedDistanceRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 6,
+    marginVertical: 4,
+  },
+  focusedDistanceNumber: {
+    fontSize: 44,
+    fontWeight: "900",
+    color: "#1f6feb",
+    fontVariant: ["tabular-nums"],
+  },
+  focusedDistanceUnit: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#57606a",
+  },
+  proximityPillRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 8,
+    flexWrap: "wrap",
+    justifyContent: "center",
+  },
+  proximityPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  pillClose: {
+    backgroundColor: "#dafbe1",
+    borderColor: "#1a7f37",
+  },
+  pillMedium: {
+    backgroundColor: "#ddf4ff",
+    borderColor: "#0969da",
+  },
+  pillFar: {
+    backgroundColor: "#fff8c5",
+    borderColor: "#d29922",
+  },
+  proximityPillText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#24292f",
+  },
+  signalMetricsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 10,
+  },
+  signalMetricBox: {
+    flex: 1,
+    backgroundColor: "#f6f8fa",
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    alignItems: "center",
+  },
+  signalMetricLabel: {
+    fontSize: 9,
+    fontWeight: "700",
+    color: "#57606a",
+    marginBottom: 2,
+  },
+  signalMetricVal: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#24292f",
+  },
+  sparklineCard: {
+    backgroundColor: "#f6f8fa",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    padding: 10,
+    marginBottom: 10,
+  },
+  sparklineHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
+  sparklineTitle: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#24292f",
+  },
+  sparklineSub: {
+    fontSize: 10,
+    color: "#57606a",
+  },
+  calibrationCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    padding: 10,
+    marginBottom: 6,
+  },
+  calibrationTitle: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#24292f",
+    marginBottom: 6,
+  },
+  calibControlsRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  calibItem: {
+    flex: 1,
+    backgroundColor: "#f6f8fa",
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#ebeef2",
+  },
+  calibLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#57606a",
+    marginBottom: 4,
+  },
+  plusMinusRow: {
+    flexDirection: "row",
+    gap: 6,
+  },
+  calibBtn: {
+    flex: 1,
+    backgroundColor: "#ffffff",
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+    alignItems: "center",
+  },
+  calibBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#1f6feb",
+  },
+
+  // OTA Styles
   otaBox: {
     flexDirection: "row",
     alignItems: "center",
