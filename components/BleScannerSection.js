@@ -11,11 +11,21 @@ import {
 } from "react-native";
 import {
   getBleManager,
-  calculateDistance,
   getSignalQuality,
   requestBluetoothPermissions,
   ensureBluetoothEnabled,
-  isBleSupported
+  DeviceDistanceTracker,
+  UI_UPDATE_INTERVAL_MS,
+  INITIAL_SAMPLE_SIZE,
+  DEFAULT_TX_POWER,
+  DEFAULT_ENV_N,
+  STATIONARY_STEP_LIMIT,
+  MOVING_STEP_LIMIT,
+  DEAD_ZONE,
+  APPROACH_SENSITIVITY,
+  AWAY_SENSITIVITY,
+  ONE_EURO_MIN_CUTOFF,
+  ONE_EURO_BETA
 } from "../services/BleScannerService.js";
 
 export default function BleScannerSection() {
@@ -23,14 +33,54 @@ export default function BleScannerSection() {
   const [devices, setDevices] = useState({});
   const [bluetoothStatus, setBluetoothStatus] = useState("Unknown");
   const [filterNamedOnly, setFilterNamedOnly] = useState(false);
-  const [environmentalN, setEnvironmentalN] = useState(2.2); // Indoor exponent
-  const [txPower1m, setTxPower1m] = useState(-59); // RSSI at 1 meter
+  const [environmentalN, setEnvironmentalN] = useState(DEFAULT_ENV_N);
+  const [txPower1m, setTxPower1m] = useState(DEFAULT_TX_POWER);
   const [isExpoGoNotice, setIsExpoGoNotice] = useState(false);
-  
+
   const isScanningRef = useRef(false);
   const simIntervalRef = useRef(null);
   const managerRef = useRef(null);
 
+  // Per-device filter state machines (independent from React render cycles)
+  const trackersRef = useRef(new Map());
+  const deviceMetaRef = useRef(new Map());
+
+  // Keep tracker parameters updated if txPower or environmentalN changes
+  useEffect(() => {
+    trackersRef.current.forEach((tracker) => {
+      tracker.updateParams(txPower1m, environmentalN);
+    });
+  }, [txPower1m, environmentalN]);
+
+  // --------------------------------------------------------------------------
+  // Independent UI Rendering Loop (UI_UPDATE_INTERVAL_MS = 100ms)
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    const uiInterval = setInterval(() => {
+      if (trackersRef.current.size === 0) return;
+
+      const updated = {};
+      trackersRef.current.forEach((tracker, id) => {
+        // Step distance through adaptive rate limiter
+        tracker.stepDistance();
+        const trackerState = tracker.getState();
+        const meta = deviceMetaRef.current.get(id) || {};
+
+        updated[id] = {
+          ...meta,
+          ...trackerState,
+        };
+      });
+
+      setDevices(updated);
+    }, UI_UPDATE_INTERVAL_MS);
+
+    return () => clearInterval(uiInterval);
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // BLE Manager Setup & State Listener
+  // --------------------------------------------------------------------------
   useEffect(() => {
     const mgr = getBleManager();
     managerRef.current = mgr;
@@ -41,7 +91,6 @@ export default function BleScannerSection() {
       return;
     }
 
-    // Monitor Bluetooth Adapter State
     let subscription;
     try {
       subscription = mgr.onStateChange((state) => {
@@ -75,51 +124,50 @@ export default function BleScannerSection() {
     }
   };
 
+  // Helper to ingest a BLE packet for a device
+  const processIncomingPacket = (id, name, rawRssi, extraMeta = {}) => {
+    let tracker = trackersRef.current.get(id);
+    if (!tracker) {
+      tracker = new DeviceDistanceTracker(id, txPower1m, environmentalN);
+      trackersRef.current.set(id, tracker);
+    }
+
+    tracker.addPacket(rawRssi);
+
+    deviceMetaRef.current.set(id, {
+      id,
+      name: name || deviceMetaRef.current.get(id)?.name || null,
+      txPowerLevel: extraMeta.txPowerLevel,
+      isConnectable: extraMeta.isConnectable,
+      ...extraMeta,
+    });
+  };
+
+  // --------------------------------------------------------------------------
+  // Start BLE Scan (Hardware scanning or Expo Go simulation stream)
+  // --------------------------------------------------------------------------
   const startScan = async () => {
     try {
       const mgr = managerRef.current;
 
-      // If in Expo Go where react-native-ble-plx native module isn't linked, run simulation demo beacons
+      // In Expo Go without custom native dev build, run realistic simulation stream
       if (!mgr) {
         setIsScanning(true);
         isScanningRef.current = true;
-        
-        // Populate initial simulated BLE beacons
-        const initialBeacons = [
-          { id: "BLE:Beacon:Room-101", name: "Indoor Beacon North", baseRssi: -58 },
-          { id: "BLE:Beacon:Hallway-A", name: "Hallway Gateway BLE", baseRssi: -71 },
-          { id: "BLE:Beacon:Entrance", name: "Entrance Node", baseRssi: -84 },
-          { id: "FE:4C:29:88:1A:05", name: null, baseRssi: -90 }
+
+        const simulatedNodes = [
+          { id: "BLE:Beacon:North-101", name: "Indoor Beacon North", baseRssi: -56, velocity: -0.15 },
+          { id: "BLE:Beacon:Gateway-A", name: "Hallway Gateway BLE", baseRssi: -72, velocity: 0.20 },
+          { id: "BLE:Beacon:Entrance", name: "Entrance Node", baseRssi: -84, velocity: 0.0 },
+          { id: "C4:D3:5B:89:12:FA", name: "Smart Tag BLE", baseRssi: -65, velocity: -0.25 },
         ];
 
+        let simTick = 0;
         simIntervalRef.current = setInterval(() => {
-          setDevices((prev) => {
-            const updated = { ...prev };
-            const now = Date.now();
+          simTick++;
+          simNodesStream(simulatedNodes, simTick);
+        }, 150);
 
-            initialBeacons.forEach((b) => {
-              // Add slight random fluctuation (+/- 3 dBm) to simulate physical movement
-              const jitter = Math.floor(Math.random() * 5) - 2;
-              const currentRssi = Math.min(-40, Math.max(-98, b.baseRssi + jitter));
-              const existing = updated[b.id];
-              const smoothedRssi = existing
-                ? Math.round(existing.rssi * 0.4 + currentRssi * 0.6)
-                : currentRssi;
-              const smoothedDist = calculateDistance(smoothedRssi, txPower1m, environmentalN);
-
-              updated[b.id] = {
-                id: b.id,
-                name: b.name,
-                rssi: smoothedRssi,
-                distance: smoothedDist,
-                txPowerLevel: -59,
-                isConnectable: true,
-                lastSeen: now,
-              };
-            });
-            return updated;
-          });
-        }, 1200);
         return;
       }
 
@@ -138,7 +186,7 @@ export default function BleScannerSection() {
       setIsScanning(true);
       isScanningRef.current = true;
 
-      // Start device scan with allowDuplicates true to get real-time continuous RSSI updates
+      // Start continuous scanning with duplicate packets allowed for high-frequency RSSI stream
       mgr.startDeviceScan(
         null,
         { allowDuplicates: true },
@@ -149,32 +197,16 @@ export default function BleScannerSection() {
             return;
           }
 
-          if (scannedDevice) {
-            const now = Date.now();
-            const currentRssi = scannedDevice.rssi || -100;
-
-            setDevices((prev) => {
-              const existing = prev[scannedDevice.id];
-              // Apply exponential smoothing to RSSI if device was already seen to prevent jitter
-              const smoothedRssi = existing
-                ? Math.round(existing.rssi * 0.4 + currentRssi * 0.6)
-                : currentRssi;
-
-              const smoothedDist = calculateDistance(smoothedRssi, txPower1m, environmentalN);
-
-              return {
-                ...prev,
-                [scannedDevice.id]: {
-                  id: scannedDevice.id,
-                  name: scannedDevice.name || scannedDevice.localName || null,
-                  rssi: smoothedRssi,
-                  distance: smoothedDist,
-                  txPowerLevel: scannedDevice.txPowerLevel,
-                  isConnectable: scannedDevice.isConnectable,
-                  lastSeen: now,
-                }
-              };
-            });
+          if (scannedDevice && scannedDevice.rssi !== null && scannedDevice.rssi !== undefined) {
+            processIncomingPacket(
+              scannedDevice.id,
+              scannedDevice.name || scannedDevice.localName,
+              scannedDevice.rssi,
+              {
+                txPowerLevel: scannedDevice.txPowerLevel,
+                isConnectable: scannedDevice.isConnectable,
+              }
+            );
           }
         }
       );
@@ -183,6 +215,21 @@ export default function BleScannerSection() {
       Alert.alert("Scan Error", err.message || "Failed to start BLE scanning.");
       stopScan();
     }
+  };
+
+  // Simulation packet generator for Expo Go
+  const simNodesStream = (nodes, tick) => {
+    nodes.forEach((node) => {
+      // Simulate real RF multipath noise (+/- 2 dBm) around dynamic movement
+      const noise = (Math.sin(tick * 0.4 + node.baseRssi) * 2) + ((Math.random() - 0.5) * 1.5);
+      const dynamicRssi = Math.round(node.baseRssi + (Math.sin(tick * 0.08) * 10 * Math.sign(node.velocity || 1)) + noise);
+      const clampedRssi = Math.min(-42, Math.max(-98, dynamicRssi));
+
+      processIncomingPacket(node.id, node.name, clampedRssi, {
+        txPowerLevel: -59,
+        isConnectable: true,
+      });
+    });
   };
 
   const stopScan = () => {
@@ -203,28 +250,34 @@ export default function BleScannerSection() {
   };
 
   const handleClearDevices = () => {
+    trackersRef.current.clear();
+    deviceMetaRef.current.clear();
     setDevices({});
   };
 
-  // Convert device dictionary to sorted array
+  // Convert device dictionary to sorted list (closest / strongest first)
   const deviceList = Object.values(devices)
     .filter((d) => !filterNamedOnly || (d.name && d.name.trim().length > 0))
-    .sort((a, b) => b.rssi - a.rssi); // Closest / strongest first
+    .sort((a, b) => {
+      if (a.distance === null) return 1;
+      if (b.distance === null) return -1;
+      return a.distance - b.distance;
+    });
 
   return (
     <View style={s.card}>
       {/* Header */}
       <View style={s.headerRow}>
         <View style={{ flex: 1 }}>
-          <Text style={s.sectionTitle}>Nearby BLE Beacon & RSSI Scanner</Text>
+          <Text style={s.sectionTitle}>Fast & Smooth BLE Distance</Text>
           <Text style={s.subText}>
-            Bluetooth: <Text style={{ fontWeight: "700", color: bluetoothStatus === "PoweredOn" ? "#1a7f37" : "#cf222e" }}>{bluetoothStatus}</Text> • Formula: $10^{`{(Tx - RSSI) / (10n)}`}$
+            Bluetooth: <Text style={{ fontWeight: "700", color: bluetoothStatus === "PoweredOn" ? "#1a7f37" : "#cf222e" }}>{bluetoothStatus}</Text>
           </Text>
         </View>
         {isScanning && (
           <View style={s.scanningBadge}>
             <ActivityIndicator size="small" color="#1f6feb" />
-            <Text style={s.scanningText}>Scanning</Text>
+            <Text style={s.scanningText}>Live Tracking</Text>
           </View>
         )}
       </View>
@@ -247,10 +300,10 @@ export default function BleScannerSection() {
         </Pressable>
       </View>
 
-      {/* Filter & Calibration Options */}
+      {/* Pipeline Config & Tuning Indicators */}
       <View style={s.filterRow}>
         <View style={s.switchItem}>
-          <Text style={s.filterLabel}>Named Devices Only</Text>
+          <Text style={s.filterLabel}>Named Only</Text>
           <Switch
             value={filterNamedOnly}
             onValueChange={setFilterNamedOnly}
@@ -259,73 +312,110 @@ export default function BleScannerSection() {
           />
         </View>
         <View style={s.paramBadge}>
-          <Text style={s.paramText}>Tx@1m: {txPower1m}dBm | n: {environmentalN}</Text>
+          <Text style={s.paramText}>Lock: {INITIAL_SAMPLE_SIZE} pkts | 1€-Filter | 100ms UI</Text>
         </View>
       </View>
 
       {/* Device Count Summary */}
       <View style={s.summaryBar}>
         <Text style={s.summaryText}>
-          Discovered: <Text style={{ fontWeight: "800", color: "#24292f" }}>{deviceList.length}</Text> active BLE signal{deviceList.length === 1 ? "" : "s"}
+          Tracking: <Text style={{ fontWeight: "800", color: "#24292f" }}>{deviceList.length}</Text> BLE device{deviceList.length === 1 ? "" : "s"}
         </Text>
-        <Text style={s.summaryHint}>Sorted by Proximity (Strongest RSSI first)</Text>
+        <Text style={s.summaryHint}>Sorted by Proximity (Nearest first)</Text>
       </View>
 
-      {/* Device List */}
+      {/* Device Cards List */}
       {deviceList.length === 0 ? (
         <View style={s.emptyBox}>
           <Text style={s.emptyTitle}>
-            {isScanning ? "Searching for nearby BLE devices..." : "Scanner is currently idle"}
+            {isScanning ? "Waiting for initial BLE packets..." : "Scanner is currently idle"}
           </Text>
           <Text style={s.emptySub}>
             {isScanning
-              ? "Ensure Bluetooth beacons, fitness bands, or BLE hardware are broadcasting."
-              : "Tap 'Start BLE Scan' above to request Bluetooth permissions and detect nearby signals."}
+              ? `Fast Lock will calculate initial distance on the first ${INITIAL_SAMPLE_SIZE} RSSI samples.`
+              : "Tap 'Start BLE Scan' above to begin low-latency filtered distance tracking."}
           </Text>
         </View>
       ) : (
         <ScrollView style={s.deviceScroll} nestedScrollEnabled>
           {deviceList.map((device) => {
-            const quality = getSignalQuality(device.rssi);
+            const rawRssi = device.rawRssi || device.filteredRssi || -100;
+            const quality = getSignalQuality(rawRssi);
             const isNamed = !!device.name;
+
+            // Movement trend style helper
+            let trendLabel = "Stationary";
+            let trendColor = "#57606a";
+            let trendBg = "#f6f8fa";
+            let trendIcon = "⚪";
+
+            if (device.trend === "approaching") {
+              trendLabel = "Approaching";
+              trendColor = "#1a7f37";
+              trendBg = "#dafbe1";
+              trendIcon = "🟢";
+            } else if (device.trend === "moving_away") {
+              trendLabel = "Moving Away";
+              trendColor = "#d29922";
+              trendBg = "#fff8c5";
+              trendIcon = "🟠";
+            }
 
             return (
               <View key={device.id} style={s.deviceCard}>
+                {/* Header: Name + Badges */}
                 <View style={s.deviceHeader}>
-                  <View style={{ flex: 1 }}>
+                  <View style={{ flex: 1, marginRight: 8 }}>
                     <Text style={[s.deviceName, !isNamed && s.unnamedDevice]}>
-                      {device.name || "Unknown BLE Device / Beacon"}
+                      {device.name || "Unknown BLE Beacon"}
                     </Text>
                     <Text style={s.deviceId}>ID: {device.id}</Text>
                   </View>
-                  <View style={[s.qualityBadge, { backgroundColor: quality.bg, borderColor: quality.color }]}>
-                    <Text style={[s.qualityText, { color: quality.color }]}>
-                      {quality.label}
-                    </Text>
+
+                  <View style={{ alignItems: "flex-end", gap: 4 }}>
+                    {device.isLocked ? (
+                      <View style={s.lockedBadge}>
+                        <Text style={s.lockedText}>⚡ Fast Locked</Text>
+                      </View>
+                    ) : (
+                      <View style={s.lockingBadge}>
+                        <Text style={s.lockingText}>
+                          Locking ({device.sampleCount || 0}/{INITIAL_SAMPLE_SIZE})
+                        </Text>
+                      </View>
+                    )}
+
+                    <View style={[s.trendBadge, { backgroundColor: trendBg, borderColor: trendColor }]}>
+                      <Text style={[s.trendText, { color: trendColor }]}>
+                        {trendIcon} {trendLabel}
+                      </Text>
+                    </View>
                   </View>
                 </View>
 
-                {/* Metrics Row: RSSI + Estimated Distance */}
-                <View style={s.metricRow}>
-                  <View style={s.metricItem}>
-                    <Text style={s.metricTitle}>Signal Strength</Text>
-                    <Text style={[s.metricNumber, { color: quality.color }]}>
-                      {device.rssi} <Text style={s.metricUnit}>dBm</Text>
+                {/* Primary Metric Hero: Smooth Distance */}
+                <View style={s.heroMetricBox}>
+                  <View style={s.heroLeft}>
+                    <Text style={s.heroLabel}>ESTIMATED DISTANCE</Text>
+                    <Text style={s.heroValue}>
+                      {device.distance !== null ? `${device.distance}` : "--"}
+                      <Text style={s.heroUnit}> meters</Text>
                     </Text>
                   </View>
 
-                  <View style={s.metricDivider} />
+                  <View style={s.heroDivider} />
 
-                  <View style={s.metricItem}>
-                    <Text style={s.metricTitle}>Est. Distance</Text>
-                    <Text style={s.distNumber}>
-                      {device.distance !== null ? `~${device.distance}` : "--"}{" "}
-                      <Text style={s.metricUnit}>meters</Text>
+                  <View style={s.heroRight}>
+                    <Text style={s.heroLabel}>SIGNAL (1€ FILTERED)</Text>
+                    <Text style={[s.rssiValue, { color: quality.color }]}>
+                      {device.filteredRssi !== null ? device.filteredRssi : rawRssi}{" "}
+                      <Text style={s.heroUnit}>dBm</Text>
                     </Text>
+                    <Text style={s.rawRssiSub}>Raw: {device.rawRssi || "--"} dBm</Text>
                   </View>
                 </View>
 
-                {/* Signal Strength Visual Bar */}
+                {/* Signal Bar */}
                 <View style={s.barContainer}>
                   <View
                     style={[
@@ -341,10 +431,12 @@ export default function BleScannerSection() {
                 {/* Footer Info */}
                 <View style={s.deviceFooter}>
                   <Text style={s.footerText}>
-                    Last seen: {Math.max(0, Math.round((Date.now() - device.lastSeen) / 1000))}s ago
+                    Last packet: {Math.max(0, Math.round((Date.now() - (device.lastSeen || Date.now())) / 1000))}s ago
                   </Text>
-                  {device.txPowerLevel !== undefined && (
-                    <Text style={s.footerText}>TxPower: {device.txPowerLevel} dBm</Text>
+                  {device.targetDistance !== null && (
+                    <Text style={s.footerText}>
+                      Target: ~{device.targetDistance}m • {quality.label}
+                    </Text>
                   )}
                 </View>
               </View>
@@ -467,9 +559,10 @@ const s = StyleSheet.create({
     borderColor: "#e1e4e8",
   },
   paramText: {
-    fontSize: 11,
+    fontSize: 10,
     color: "#57606a",
     fontFamily: "monospace",
+    fontWeight: "600",
   },
   summaryBar: {
     flexDirection: "row",
@@ -509,24 +602,24 @@ const s = StyleSheet.create({
     lineHeight: 18,
   },
   deviceScroll: {
-    maxHeight: 280,
+    maxHeight: 340,
   },
   deviceCard: {
     backgroundColor: "#ffffff",
-    borderRadius: 10,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: "#e1e4e8",
-    padding: 10,
-    marginBottom: 8,
+    padding: 12,
+    marginBottom: 10,
     shadowColor: "#000",
-    shadowOpacity: 0.02,
-    shadowRadius: 3,
+    shadowOpacity: 0.03,
+    shadowRadius: 4,
   },
   deviceHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "flex-start",
-    marginBottom: 6,
+    marginBottom: 8,
   },
   deviceName: {
     fontSize: 14,
@@ -543,65 +636,102 @@ const s = StyleSheet.create({
     color: "#8c959f",
     marginTop: 1,
   },
-  qualityBadge: {
-    paddingHorizontal: 7,
+  lockedBadge: {
+    backgroundColor: "#dafbe1",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#1a7f37",
+  },
+  lockedText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#1a7f37",
+  },
+  lockingBadge: {
+    backgroundColor: "#fff8c5",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#d29922",
+  },
+  lockingText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#9a6700",
+  },
+  trendBadge: {
+    paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
     borderWidth: 1,
   },
-  qualityText: {
-    fontSize: 11,
-    fontWeight: "800",
+  trendText: {
+    fontSize: 10,
+    fontWeight: "700",
   },
-  metricRow: {
+  heroMetricBox: {
     flexDirection: "row",
     alignItems: "center",
     backgroundColor: "#f6f8fa",
-    borderRadius: 8,
-    paddingVertical: 6,
-    paddingHorizontal: 8,
-    marginVertical: 6,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#ebeef2",
   },
-  metricItem: {
+  heroLeft: {
+    flex: 1.2,
+  },
+  heroRight: {
     flex: 1,
-    alignItems: "center",
+    alignItems: "flex-end",
   },
-  metricDivider: {
+  heroDivider: {
     width: 1,
-    height: 24,
+    height: 36,
     backgroundColor: "#d0d7de",
+    marginHorizontal: 8,
   },
-  metricTitle: {
-    fontSize: 10,
-    fontWeight: "600",
+  heroLabel: {
+    fontSize: 9,
+    fontWeight: "700",
     color: "#57606a",
-    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginBottom: 2,
   },
-  metricNumber: {
-    fontSize: 16,
-    fontWeight: "800",
-  },
-  distNumber: {
-    fontSize: 16,
-    fontWeight: "800",
+  heroValue: {
+    fontSize: 20,
+    fontWeight: "900",
     color: "#1f6feb",
   },
-  metricUnit: {
+  rssiValue: {
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  rawRssiSub: {
+    fontSize: 10,
+    color: "#8c959f",
+    marginTop: 1,
+  },
+  heroUnit: {
     fontSize: 11,
-    fontWeight: "500",
+    fontWeight: "600",
     color: "#57606a",
   },
   barContainer: {
-    height: 5,
+    height: 4,
     backgroundColor: "#eaeef2",
-    borderRadius: 3,
+    borderRadius: 2,
     overflow: "hidden",
-    marginTop: 2,
     marginBottom: 6,
   },
   barFill: {
     height: "100%",
-    borderRadius: 3,
+    borderRadius: 2,
   },
   deviceFooter: {
     flexDirection: "row",

@@ -1,3 +1,20 @@
+// ============================================================================
+// USER CONFIGURABLE PARAMETERS (Tune for indoor/outdoor/crowded BLE)
+// ============================================================================
+export const INITIAL_SAMPLE_SIZE = 3;       // Number of RSSI packets for fast initial lock
+export const MEDIAN_WINDOW = 3;             // Rolling median filter size
+export const UI_UPDATE_INTERVAL_MS = 100;   // UI refresh rate (in ms)
+export const STATIONARY_STEP_LIMIT = 0.25;  // Max distance change (m) per update when stable (0.2–0.3)
+export const MOVING_STEP_LIMIT = 0.85;      // Max distance change (m) per update when moving (0.7–1.0)
+export const DEAD_ZONE = 0.20;              // Ignore tiny fluctuations (m) when stationary (0.15–0.25)
+export const APPROACH_SENSITIVITY = 1.2;    // How fast it reacts when getting closer (> 1.0 is faster)
+export const AWAY_SENSITIVITY = 1.0;        // How fast it reacts when moving away
+export const ONE_EURO_MIN_CUTOFF = 1.0;     // One-Euro smoothing baseline frequency (fc_min in Hz)
+export const ONE_EURO_BETA = 0.05;          // One-Euro responsiveness speed coefficient
+export const DEFAULT_TX_POWER = -59;        // Measured RSSI at 1 meter (dBm)
+export const DEFAULT_ENV_N = 2.2;           // Path loss exponent for indoor environment
+// ============================================================================
+
 import { Platform, PermissionsAndroid, Alert, Linking, NativeModules } from "react-native";
 
 let BleManager = null;
@@ -13,7 +30,6 @@ let bleManagerInstance = null;
 let bleInitError = null;
 
 export function isBleSupported() {
-  // Check if NativeModules has BleClientModule linked
   return !!(
     BleManager &&
     (NativeModules.BleClientModule || NativeModules.BleClient || NativeModules.RNBLE)
@@ -38,17 +54,274 @@ export function getBleManager() {
   return bleManagerInstance;
 }
 
+// ============================================================================
+// LOW-PASS & ONE-EURO FILTER IMPLEMENTATION
+// ============================================================================
+class LowPassFilter {
+  constructor(alpha = 1.0, initVal = 0) {
+    this.alpha = alpha;
+    this.s = initVal;
+    this.initialized = false;
+  }
+
+  filter(val, alpha = this.alpha) {
+    if (!this.initialized) {
+      this.s = val;
+      this.initialized = true;
+      return val;
+    }
+    this.s = alpha * val + (1.0 - alpha) * this.s;
+    return this.s;
+  }
+
+  last() {
+    return this.s;
+  }
+
+  reset() {
+    this.initialized = false;
+  }
+}
+
+export class OneEuroFilter {
+  constructor(minCutoff = ONE_EURO_MIN_CUTOFF, beta = ONE_EURO_BETA, dCutoff = 1.0) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xFilter = new LowPassFilter(1);
+    this.dxFilter = new LowPassFilter(1);
+    this.lastTime = null;
+  }
+
+  alpha(cutoff, dt) {
+    const tau = 1.0 / (2.0 * Math.PI * cutoff);
+    return 1.0 / (1.0 + tau / dt);
+  }
+
+  filter(val, timestamp = Date.now(), betaOverride = null, minCutoffOverride = null) {
+    if (this.lastTime === null) {
+      this.lastTime = timestamp;
+      this.xFilter.filter(val);
+      this.dxFilter.filter(0);
+      return val;
+    }
+
+    const dt = Math.max(0.001, (timestamp - this.lastTime) / 1000.0);
+    this.lastTime = timestamp;
+
+    const prevX = this.xFilter.last();
+    const dx = (val - prevX) / dt;
+    const edx = this.dxFilter.filter(dx, this.alpha(this.dCutoff, dt));
+
+    const curBeta = betaOverride !== null ? betaOverride : this.beta;
+    const curMinCutoff = minCutoffOverride !== null ? minCutoffOverride : this.minCutoff;
+
+    const cutoff = curMinCutoff + curBeta * Math.abs(edx);
+    return this.xFilter.filter(val, this.alpha(cutoff, dt));
+  }
+
+  reset() {
+    this.lastTime = null;
+    this.xFilter.reset();
+    this.dxFilter.reset();
+  }
+}
+
+// ============================================================================
+// PER-DEVICE FAST & SMOOTH DISTANCE TRACKER
+// ============================================================================
+export class DeviceDistanceTracker {
+  constructor(deviceId, txPower = DEFAULT_TX_POWER, envN = DEFAULT_ENV_N) {
+    this.deviceId = deviceId;
+    this.txPower = txPower;
+    this.envN = envN;
+
+    this.initialSamples = [];
+    this.rollingWindow = [];
+    this.recentDistances = [];
+    this.isLocked = false;
+
+    this.oneEuro = new OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+
+    this.rawRssi = null;
+    this.filteredRssi = null;
+    this.targetDistance = null;
+    this.currentDistance = null;
+    this.trend = "stationary"; // "approaching" | "stationary" | "moving_away"
+    this.lastPacketTime = Date.now();
+  }
+
+  updateParams(txPower, envN) {
+    this.txPower = txPower;
+    this.envN = envN;
+    if (this.filteredRssi !== null) {
+      this.targetDistance = this.rssiToDistance(this.filteredRssi);
+    }
+  }
+
+  rssiToDistance(rssi) {
+    if (!rssi || rssi === 0) return null;
+    const ratio = (this.txPower - rssi) / (10 * this.envN);
+    return Math.pow(10, ratio);
+  }
+
+  addPacket(rawRssi, timestamp = Date.now()) {
+    if (typeof rawRssi !== "number" || isNaN(rawRssi)) return;
+
+    // Outlier rejection for impossible BLE RSSI values
+    if (rawRssi < -115 || rawRssi > -10) return;
+
+    this.rawRssi = rawRssi;
+    this.lastPacketTime = timestamp;
+
+    // ------------------------------------------------------------------------
+    // PHASE 1: Fast Lock Mode (Initial Sample Collection)
+    // ------------------------------------------------------------------------
+    if (!this.isLocked) {
+      this.initialSamples.push(rawRssi);
+      this.rollingWindow.push(rawRssi);
+
+      if (this.initialSamples.length >= INITIAL_SAMPLE_SIZE) {
+        // Fast lock triggered on first INITIAL_SAMPLE_SIZE valid samples
+        const sorted = [...this.initialSamples].sort((a, b) => a - b);
+        const medianRssi = sorted[Math.floor(sorted.length / 2)];
+
+        this.filteredRssi = medianRssi;
+        this.oneEuro.filter(medianRssi, timestamp);
+
+        const initDist = this.rssiToDistance(medianRssi);
+        this.targetDistance = initDist;
+        this.currentDistance = initDist;
+        this.recentDistances = [initDist];
+        this.isLocked = true;
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // PHASE 2: Tracking Mode (Rolling Median + One-Euro Filter)
+    // ------------------------------------------------------------------------
+    this.rollingWindow.push(rawRssi);
+    if (this.rollingWindow.length > MEDIAN_WINDOW) {
+      this.rollingWindow.shift();
+    }
+
+    const sortedWindow = [...this.rollingWindow].sort((a, b) => a - b);
+    const medianWindowRssi = sortedWindow[Math.floor(sortedWindow.length / 2)];
+
+    // Adaptive One-Euro tuning based on current detected trend
+    let beta = ONE_EURO_BETA;
+    let minCutoff = ONE_EURO_MIN_CUTOFF;
+
+    if (this.trend === "approaching") {
+      beta *= APPROACH_SENSITIVITY;
+      minCutoff *= 1.4; // Less smoothing when moving closer for instant reaction
+    } else if (this.trend === "moving_away") {
+      beta *= AWAY_SENSITIVITY;
+      minCutoff *= 1.2;
+    } else {
+      // Stationary: increase smoothing to prevent jitter
+      minCutoff *= 0.7;
+    }
+
+    this.filteredRssi = this.oneEuro.filter(medianWindowRssi, timestamp, beta, minCutoff);
+    this.targetDistance = this.rssiToDistance(this.filteredRssi);
+
+    // Update movement trend
+    this.updateTrend(this.targetDistance);
+  }
+
+  updateTrend(newTargetDist) {
+    if (newTargetDist === null) return;
+    this.recentDistances.push(newTargetDist);
+    if (this.recentDistances.length > 5) {
+      this.recentDistances.shift();
+    }
+
+    if (this.recentDistances.length < 3) {
+      this.trend = "stationary";
+      return;
+    }
+
+    const first = this.recentDistances[0];
+    const last = this.recentDistances[this.recentDistances.length - 1];
+    const diff = last - first;
+
+    if (diff < -0.25) {
+      this.trend = "approaching";
+    } else if (diff > 0.30) {
+      this.trend = "moving_away";
+    } else {
+      this.trend = "stationary";
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Adaptive Rate Limiter & Dead Zone Step
+  // --------------------------------------------------------------------------
+  stepDistance() {
+    if (this.targetDistance === null) return null;
+    if (this.currentDistance === null) {
+      this.currentDistance = this.targetDistance;
+      return Number(this.currentDistance.toFixed(2));
+    }
+
+    const diff = this.targetDistance - this.currentDistance;
+    const absDiff = Math.abs(diff);
+
+    // Dead Zone: ignore tiny fluctuations when stationary
+    if (this.trend === "stationary" && absDiff < DEAD_ZONE) {
+      return Number(this.currentDistance.toFixed(2));
+    }
+
+    // Adaptive step limit based on state
+    let stepLimit;
+    if (this.trend === "approaching") {
+      stepLimit = MOVING_STEP_LIMIT * APPROACH_SENSITIVITY;
+    } else if (this.trend === "moving_away") {
+      stepLimit = MOVING_STEP_LIMIT * AWAY_SENSITIVITY;
+    } else {
+      stepLimit = STATIONARY_STEP_LIMIT;
+    }
+
+    // Apply rate limit clamp to prevent wild jumps (e.g., 2m -> 8m -> 3m)
+    const step = Math.sign(diff) * Math.min(absDiff, stepLimit);
+    this.currentDistance += step;
+
+    return Number(this.currentDistance.toFixed(2));
+  }
+
+  getState() {
+    return {
+      isLocked: this.isLocked,
+      sampleCount: this.initialSamples.length,
+      rawRssi: this.rawRssi,
+      filteredRssi: this.filteredRssi !== null ? Math.round(this.filteredRssi) : this.rawRssi,
+      distance: this.currentDistance !== null ? Number(this.currentDistance.toFixed(2)) : null,
+      targetDistance: this.targetDistance !== null ? Number(this.targetDistance.toFixed(2)) : null,
+      trend: this.trend,
+      lastSeen: this.lastPacketTime
+    };
+  }
+
+  reset() {
+    this.initialSamples = [];
+    this.rollingWindow = [];
+    this.recentDistances = [];
+    this.isLocked = false;
+    this.oneEuro.reset();
+    this.rawRssi = null;
+    this.filteredRssi = null;
+    this.targetDistance = null;
+    this.currentDistance = null;
+    this.trend = "stationary";
+  }
+}
+
 /**
- * Calculates estimated physical distance (in meters) from RSSI
- * using the Log-Distance Path Loss Model:
- * Distance = 10 ^ ((MeasuredPower - RSSI) / (10 * n))
- *
- * @param {number} rssi - Received Signal Strength Indication (dBm)
- * @param {number} measuredPower - Expected RSSI at 1 meter distance (default: -59 dBm)
- * @param {number} pathLossExponent - Environmental path loss exponent (default: 2.2 for indoor)
- * @returns {number|null} estimated distance in meters rounded to 2 decimal places
+ * Calculates raw estimated physical distance (in meters) from RSSI
  */
-export function calculateDistance(rssi, measuredPower = -59, pathLossExponent = 2.2) {
+export function calculateDistance(rssi, measuredPower = DEFAULT_TX_POWER, pathLossExponent = DEFAULT_ENV_N) {
   if (!rssi || rssi === 0) return null;
   const ratio = (measuredPower - rssi) / (10 * pathLossExponent);
   const distance = Math.pow(10, ratio);
@@ -76,7 +349,7 @@ export function getSignalQuality(rssi) {
 export async function requestBluetoothPermissions() {
   if (Platform.OS === "android") {
     const apiLevel = Platform.Version;
-    
+
     // Android 12+ (API level 31+)
     if (apiLevel >= 31) {
       const granted = await PermissionsAndroid.requestMultiple([
