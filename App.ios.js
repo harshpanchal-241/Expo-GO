@@ -9,7 +9,7 @@ import {
   Alert,
   Dimensions
 } from "react-native";
-import Svg, { Polyline, Circle, Line, Polygon, Text as SvgText } from "react-native-svg";
+import Svg, { Polyline, Circle, Line, Polygon, Text as SvgText, Rect } from "react-native-svg";
 import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-sensors";
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import BleScannerSection from "./components/BleScannerSection.js";
@@ -17,6 +17,7 @@ import OtaUpdateCard from "./components/OtaUpdateCard.js";
 
 // Helper angle utilities
 const norm = d => {
+  if (typeof d !== "number" || isNaN(d)) return 0;
   let x = d % 360;
   if (x < 0) x += 360;
   return x;
@@ -27,8 +28,8 @@ const radToDeg = r => (r * 180) / Math.PI;
 // Sensitivity presets for peak-valley step detection (in g)
 const SENSITIVITY_PRESETS = {
   high: { peak: 0.09, valley: -0.05, minDelay: 260, label: "High" },
-  medium: { peak: 0.13, valley: -0.07, minDelay: 300, label: "Medium (Default)" },
-  low: { peak: 0.18, valley: -0.10, minDelay: 340, label: "Low" }
+  medium: { peak: 0.13, valley: -0.07, minDelay: 290, label: "Medium (Default)" },
+  low: { peak: 0.18, valley: -0.10, minDelay: 330, label: "Low" }
 };
 
 const WEINBERG_K = 0.74; // Calibrated for acceleration in g units
@@ -57,7 +58,7 @@ export default function AppIOS() {
   // Mode switch: 'pdr' | 'ble'
   const [activeTab, setActiveTab] = useState("pdr");
 
-  // High frequency mutable state kept in refs to avoid React render lag
+  // High frequency mutable state kept in refs
   const runningRef = useRef(false);
   const rawHeadingRef = useRef(0);
   const headingZeroRef = useRef(null);
@@ -65,6 +66,8 @@ export default function AppIOS() {
   const positionRef = useRef({ x: 0, y: 0 });
   const stepLengthRef = useRef(0.70);
   const stepCountRef = useRef(0);
+  const pathRef = useRef([{ x: 0, y: 0 }]);
+  const hasDeviceMotionRotationRef = useRef(false);
 
   // Accelerometer FSM Peak-Valley Step Detector Refs
   const gravityRef = useRef(1.0);
@@ -92,46 +95,81 @@ export default function AppIOS() {
     sensitivityRef.current = SENSITIVITY_PRESETS[stepSensitivity] || SENSITIVITY_PRESETS.medium;
   }, [stepSensitivity]);
 
+  // Heading calculation helper that works for both DeviceMotion and Magnetometer
+  const updateHeadingFromRaw = useCallback((rawDeg) => {
+    if (typeof rawDeg !== "number" || isNaN(rawDeg)) return;
+    rawHeadingRef.current = rawDeg;
+
+    if (headingZeroRef.current === null) return;
+
+    // Delta relative to zero calibration (iOS CoreMotion convention: rawDeg - zero increases when turning right)
+    const deltaRaw = norm(rawDeg - headingZeroRef.current);
+    const targetHeading = deltaRaw > 180 ? deltaRaw - 360 : deltaRaw;
+    if (isNaN(targetHeading)) return;
+
+    let current = smoothedHeadingRef.current;
+    if (!isFinite(current)) current = 0;
+
+    let diff = targetHeading - current;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+
+    let updated = current + LPF_HEADING * diff;
+    if (updated > 180) updated -= 360;
+    if (updated < -180) updated += 360;
+
+    smoothedHeadingRef.current = Number(updated.toFixed(2));
+  }, []);
+
   // --------------------------------------------------------------------------
-  // Core Step Registration Function
+  // Core Step Registration Function (Bulletproof against NaN)
   // --------------------------------------------------------------------------
   const recordStep = useCallback((dynamicLen = null) => {
-    const len = autoStepLenEnabled && dynamicLen && dynamicLen >= 0.45 && dynamicLen <= 1.15
-      ? dynamicLen
-      : fixedStepLength;
+    let len = fixedStepLength;
+    if (autoStepLenEnabled && typeof dynamicLen === "number" && isFinite(dynamicLen) && dynamicLen >= 0.45 && dynamicLen <= 1.15) {
+      len = dynamicLen;
+    }
+    if (!isFinite(len) || len <= 0) len = 0.70;
 
     stepLengthRef.current = len;
 
-    const thetaDeg = smoothedHeadingRef.current;
-    const thetaRad = (thetaDeg * Math.PI) / 180;
-    const old = positionRef.current;
+    let thetaDeg = smoothedHeadingRef.current;
+    if (!isFinite(thetaDeg)) thetaDeg = 0;
 
-    // Standard Cartesian navigation frame:
-    // Heading 0 deg = +Y (Forward/North)
-    // Heading +90 deg = +X (Right/East)
-    // Heading -90 deg = -X (Left/West)
-    // Heading 180 deg = -Y (Backward/South)
+    const thetaRad = (thetaDeg * Math.PI) / 180;
+    const old = positionRef.current || { x: 0, y: 0 };
+    const oldX = isFinite(old.x) ? old.x : 0;
+    const oldY = isFinite(old.y) ? old.y : 0;
+
+    const nextX = Number((oldX + len * Math.sin(thetaRad)).toFixed(3));
+    const nextY = Number((oldY + len * Math.cos(thetaRad)).toFixed(3));
+
     const next = {
-      x: Number((old.x + len * Math.sin(thetaRad)).toFixed(3)),
-      y: Number((old.y + len * Math.cos(thetaRad)).toFixed(3))
+      x: isFinite(nextX) ? nextX : oldX,
+      y: isFinite(nextY) ? nextY : oldY
     };
 
     positionRef.current = next;
-    stepCountRef.current += 1;
+    stepCountRef.current = (stepCountRef.current || 0) + 1;
     const count = stepCountRef.current;
+
+    const updatedPath = [...pathRef.current, next];
+    pathRef.current = updatedPath;
 
     setPosition(next);
     setSteps(count);
     setCurrentStepLength(len);
-    setPath(p => [...p, next]);
+    setPath(updatedPath);
 
-    console.log(`[iOS PDR] Step #${count} | Length: ${len.toFixed(2)}m | Heading: ${thetaDeg.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
+    console.log(`[iOS PDR Step #${count}] SL=${len.toFixed(2)}m | Heading=${thetaDeg.toFixed(1)}° | Pos=(${next.x}, ${next.y}) | PathPts=${updatedPath.length}`);
   }, [autoStepLenEnabled, fixedStepLength]);
 
   // Weinberg step length estimator based on vertical acceleration bounce
   const computeWeinbergLength = useCallback((maxA, minA) => {
+    if (!isFinite(maxA) || !isFinite(minA)) return 0.70;
     const bounceDiff = Math.max(0.12, maxA - minA);
     const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
+    if (!isFinite(estimated)) return 0.70;
     return Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
   }, []);
 
@@ -140,15 +178,16 @@ export default function AppIOS() {
   // --------------------------------------------------------------------------
   useEffect(() => {
     const uiSyncTimer = setInterval(() => {
-      setHeading(smoothedHeadingRef.current);
+      const curHeading = isFinite(smoothedHeadingRef.current) ? smoothedHeadingRef.current : 0;
+      setHeading(curHeading);
       setMagneticField(magFieldRef.current);
-      setLiveDynAccel(Number(filteredDynAccelRef.current.toFixed(3)));
+      setLiveDynAccel(Number((filteredDynAccelRef.current || 0).toFixed(3)));
     }, 100);
     return () => clearInterval(uiSyncTimer);
   }, []);
 
   // --------------------------------------------------------------------------
-  // Hardware Sensor Subscriptions (Lifecycle Independent of State Changes)
+  // Hardware Sensor Subscriptions
   // --------------------------------------------------------------------------
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
@@ -170,22 +209,27 @@ export default function AppIOS() {
         if (magAvail) await Magnetometer.requestPermissionsAsync().catch(() => {});
         if (pAvail) await Pedometer.requestPermissionsAsync().catch(() => {});
 
-        // 1. Magnetometer Listener (100ms)
-        Magnetometer.setUpdateInterval(100);
+        // 1. Magnetometer Listener (40ms = 25Hz)
+        Magnetometer.setUpdateInterval(40);
         magSub = Magnetometer.addListener(data => {
           if (!data) return;
           const { x, y, z } = data;
+          if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return;
+
           const totalField = Math.sqrt(x * x + y * y + z * z);
           magFieldRef.current = {
             x: Number(x.toFixed(1)),
             y: Number(y.toFixed(1)),
             z: Number(z.toFixed(1)),
-            total: Number(totalField.toFixed(1))
+            total: Number((isFinite(totalField) ? totalField : 0).toFixed(1))
           };
 
-          if (rawHeadingRef.current === null || rawHeadingRef.current === undefined) {
-            const magHeading = norm(Math.atan2(-x, y) * (180 / Math.PI));
-            rawHeadingRef.current = magHeading;
+          let compassDeg = Math.atan2(-x, y) * (180 / Math.PI);
+          if (isNaN(compassDeg)) compassDeg = 0;
+          compassDeg = norm(compassDeg);
+
+          if (!hasDeviceMotionRotationRef.current) {
+            updateHeadingFromRaw(compassDeg);
           }
         });
 
@@ -194,30 +238,13 @@ export default function AppIOS() {
         motionSub = DeviceMotion.addListener(data => {
           if (!data) return;
 
-          let rawDeg = 0;
-          if (data.rotation && typeof data.rotation.alpha === "number") {
+          if (data.rotation && typeof data.rotation.alpha === "number" && isFinite(data.rotation.alpha)) {
+            hasDeviceMotionRotationRef.current = true;
             const alpha = data.rotation.alpha;
-            rawDeg = Math.abs(alpha) <= Math.PI * 2.2 ? radToDeg(alpha) : alpha;
+            let rawDeg = Math.abs(alpha) <= Math.PI * 2.2 ? radToDeg(alpha) : alpha;
+            if (isNaN(rawDeg)) return;
             rawDeg = norm(rawDeg);
-          } else {
-            return;
-          }
-
-          rawHeadingRef.current = rawDeg;
-
-          if (headingZeroRef.current !== null) {
-            // iOS CoreMotion alpha rotation convention: turning right increases relative heading (+90)
-            const deltaRaw = norm(rawDeg - headingZeroRef.current);
-            const targetHeading = deltaRaw > 180 ? deltaRaw - 360 : deltaRaw;
-
-            // Continuous circular low-pass filter
-            let diff = targetHeading - smoothedHeadingRef.current;
-            while (diff > 180) diff -= 360;
-            while (diff < -180) diff += 360;
-
-            smoothedHeadingRef.current = Number((smoothedHeadingRef.current + LPF_HEADING * diff).toFixed(2));
-            if (smoothedHeadingRef.current > 180) smoothedHeadingRef.current -= 360;
-            if (smoothedHeadingRef.current < -180) smoothedHeadingRef.current += 360;
+            updateHeadingFromRaw(rawDeg);
           }
         });
 
@@ -226,13 +253,14 @@ export default function AppIOS() {
         accelSub = Accelerometer.addListener(data => {
           if (!data) return;
           const { x, y, z } = data;
-          const rawMag = Math.sqrt(x * x + y * y + z * z); // in g
+          if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return;
 
-          // Update dynamic gravity baseline
+          const rawMag = Math.sqrt(x * x + y * y + z * z); // in g
+          if (!isFinite(rawMag)) return;
+
           gravityRef.current = 0.95 * gravityRef.current + 0.05 * rawMag;
           const dynAccel = rawMag - gravityRef.current;
 
-          // Filter dynamic acceleration
           filteredDynAccelRef.current += 0.35 * (dynAccel - filteredDynAccelRef.current);
           const filtered = filteredDynAccelRef.current;
 
@@ -241,7 +269,6 @@ export default function AppIOS() {
           const now = Date.now();
           const cfg = sensitivityRef.current;
 
-          // Finite State Machine for Step Detection
           if (stepStateRef.current === "IDLE") {
             if (filtered > cfg.peak && (now - lastStepTimeRef.current) > cfg.minDelay) {
               stepStateRef.current = "PEAK_DETECTED";
@@ -286,21 +313,23 @@ export default function AppIOS() {
       accelSub?.remove?.();
       magSub?.remove?.();
     };
-  }, [recordStep, computeWeinbergLength]);
+  }, [recordStep, computeWeinbergLength, updateHeadingFromRaw]);
 
   // --------------------------------------------------------------------------
   // User Actions & Controls
   // --------------------------------------------------------------------------
   const setZero = () => {
-    headingZeroRef.current = rawHeadingRef.current;
+    const raw = isFinite(rawHeadingRef.current) ? rawHeadingRef.current : 0;
+    headingZeroRef.current = raw;
     smoothedHeadingRef.current = 0;
     setHeading(0);
-    setStatus("iOS Heading zero calibrated (Forward = 0°)");
+    setStatus("Heading zero calibrated (Forward = 0°)");
   };
 
   const start = () => {
     if (headingZeroRef.current === null) {
-      headingZeroRef.current = rawHeadingRef.current;
+      const raw = isFinite(rawHeadingRef.current) ? rawHeadingRef.current : 0;
+      headingZeroRef.current = raw;
       smoothedHeadingRef.current = 0;
       setHeading(0);
     }
@@ -321,6 +350,7 @@ export default function AppIOS() {
     stepCountRef.current = 0;
     setSteps(0);
     positionRef.current = { x: 0, y: 0 };
+    pathRef.current = [{ x: 0, y: 0 }];
     setPosition({ x: 0, y: 0 });
     setPath([{ x: 0, y: 0 }]);
     stepStateRef.current = "IDLE";
@@ -328,22 +358,24 @@ export default function AppIOS() {
   };
 
   const closeLoop = () => {
-    if (path.length <= 2) {
+    const curPath = pathRef.current;
+    if (!curPath || curPath.length <= 2) {
       Alert.alert("Loop Closure Error", "Walk a closed loop path before applying loop closure.");
       return;
     }
-    const lastPt = path[path.length - 1];
-    const totalSteps = path.length - 1;
+    const lastPt = curPath[curPath.length - 1];
+    const totalSteps = curPath.length - 1;
     const dx = lastPt.x / totalSteps;
     const dy = lastPt.y / totalSteps;
 
-    const correctedPath = path.map((pt, i) => ({
+    const correctedPath = curPath.map((pt, i) => ({
       x: Number((pt.x - dx * i).toFixed(3)),
       y: Number((pt.y - dy * i).toFixed(3))
     }));
 
     const finalPos = correctedPath[correctedPath.length - 1];
     positionRef.current = finalPos;
+    pathRef.current = correctedPath;
     setPosition(finalPos);
     setPath(correctedPath);
     setStatus("Loop Closure Applied! Drift eliminated.");
@@ -618,14 +650,20 @@ function Btn({ text, onPress, strong, bg, color }) {
 }
 
 function PathPlot({ points, heading, previousPath }) {
-  const width = Math.min(Dimensions.get("window").width - 32, 520);
+  const screenWidth = Dimensions.get("window").width;
+  const width = Math.max(280, Math.min(screenWidth - 32, 520));
   const height = 340;
-  const pad = 44;
+  const pad = 40;
 
-  let allPts = [...points];
-  if (previousPath && previousPath.points && previousPath.points.length > 0) {
-    allPts = [...allPts, ...previousPath.points];
-  }
+  // Filter valid points only
+  const validPoints = (Array.isArray(points) ? points : [{ x: 0, y: 0 }])
+    .filter(p => p && typeof p.x === "number" && typeof p.y === "number" && isFinite(p.x) && isFinite(p.y));
+  const pts = validPoints.length > 0 ? validPoints : [{ x: 0, y: 0 }];
+
+  const validPrevPoints = (previousPath?.points && Array.isArray(previousPath.points) ? previousPath.points : [])
+    .filter(p => p && typeof p.x === "number" && typeof p.y === "number" && isFinite(p.x) && isFinite(p.y));
+
+  const allPts = [...pts, ...validPrevPoints];
 
   let minX = 0, maxX = 0, minY = 0, maxY = 0;
   allPts.forEach(p => {
@@ -635,63 +673,67 @@ function PathPlot({ points, heading, previousPath }) {
     maxY = Math.max(maxY, p.y);
   });
 
-  const spanX = Math.max(4, maxX - minX);
-  const spanY = Math.max(4, maxY - minY);
+  const spanX = Math.max(3.0, (maxX - minX) * 1.25);
+  const spanY = Math.max(3.0, (maxY - minY) * 1.25);
   const scale = Math.min((width - pad * 2) / spanX, (height - pad * 2) / spanY);
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
 
-  // Map real world Cartesian (m) to SVG Canvas (pixels)
-  const map = p => ({
-    x: width / 2 + (p.x - cx) * scale,
-    y: height / 2 - (p.y - cy) * scale
-  });
+  const map = p => {
+    const px = (p && isFinite(p.x)) ? p.x : 0;
+    const py = (p && isFinite(p.y)) ? p.y : 0;
+    return {
+      x: Number((width / 2 + (px - cx) * scale).toFixed(1)),
+      y: Number((height / 2 - (py - cy) * scale).toFixed(1))
+    };
+  };
 
-  const m = points.map(map);
+  const m = pts.map(map);
   const poly = m.map(p => `${p.x},${p.y}`).join(" ");
   const start = map({ x: 0, y: 0 });
   const end = m[m.length - 1] || start;
 
   let prevM = [], prevPoly = "", prevEnd = null;
-  if (previousPath && previousPath.points && previousPath.points.length > 0) {
-    prevM = previousPath.points.map(map);
+  if (validPrevPoints.length > 0) {
+    prevM = validPrevPoints.map(map);
     prevPoly = prevM.map(p => `${p.x},${p.y}`).join(" ");
     prevEnd = prevM[prevM.length - 1];
   }
 
-  // Calculate live heading arrow points at user's current position (end)
-  const headingRad = (heading * Math.PI) / 180;
-  const arrowLength = 20;
-  const arrowWingDist = 11;
-  const arrowAngleSpread = 2.4; // radians (~137 degrees)
+  const safeHeading = isFinite(heading) ? heading : 0;
+  const headingRad = (safeHeading * Math.PI) / 180;
+  const arrowLength = 18;
+  const arrowWingDist = 10;
+  const arrowAngleSpread = 2.4;
 
   const tip = {
-    x: end.x + arrowLength * Math.sin(headingRad),
-    y: end.y - arrowLength * Math.cos(headingRad)
+    x: Number((end.x + arrowLength * Math.sin(headingRad)).toFixed(1)),
+    y: Number((end.y - arrowLength * Math.cos(headingRad)).toFixed(1))
   };
   const leftWing = {
-    x: end.x + arrowWingDist * Math.sin(headingRad - arrowAngleSpread),
-    y: end.y - arrowWingDist * Math.cos(headingRad - arrowAngleSpread)
+    x: Number((end.x + arrowWingDist * Math.sin(headingRad - arrowAngleSpread)).toFixed(1)),
+    y: Number((end.y - arrowWingDist * Math.cos(headingRad - arrowAngleSpread)).toFixed(1))
   };
   const rightWing = {
-    x: end.x + arrowWingDist * Math.sin(headingRad + arrowAngleSpread),
-    y: end.y - arrowWingDist * Math.cos(headingRad + arrowAngleSpread)
+    x: Number((end.x + arrowWingDist * Math.sin(headingRad + arrowAngleSpread)).toFixed(1)),
+    y: Number((end.y - arrowWingDist * Math.cos(headingRad + arrowAngleSpread)).toFixed(1))
   };
   const arrowPolygon = `${tip.x},${tip.y} ${leftWing.x},${leftWing.y} ${end.x},${end.y} ${rightWing.x},${rightWing.y}`;
+
+  const lastPt = pts[pts.length - 1] || { x: 0, y: 0 };
 
   return (
     <View style={s.plot}>
       <Text style={s.label}>Live PDR Walk Route Map (iOS)</Text>
 
-      {/* Map Legend */}
       <View style={s.legendRow}>
         <View style={s.legendItem}>
           <View style={[s.legendColor, { backgroundColor: "#1f6feb" }]} />
-          <Text style={s.legendText}>Current Route</Text>
+          <Text style={s.legendText}>Route ({pts.length} pts)</Text>
         </View>
         <View style={s.legendItem}>
           <View style={[s.legendColor, { backgroundColor: "#cf222e" }]} />
-          <Text style={s.legendText}>Live Pointer ({heading.toFixed(0)}°)</Text>
+          <Text style={s.legendText}>Live Heading ({safeHeading.toFixed(0)}°)</Text>
         </View>
         {previousPath && (
           <View style={s.legendItem}>
@@ -702,11 +744,11 @@ function PathPlot({ points, heading, previousPath }) {
       </View>
 
       <Svg width={width} height={height}>
-        {/* Origin Axes Grid Lines */}
-        <Line x1="0" y1={start.y} x2={width} y2={start.y} stroke="#e1e4e8" strokeDasharray="4,4" />
-        <Line x1={start.x} y1="0" x2={start.x} y2={height} stroke="#e1e4e8" strokeDasharray="4,4" />
+        <Rect x="0" y="0" width={width} height={height} fill="#fafbfc" rx="10" />
 
-        {/* Previous Saved Path Overlay */}
+        <Line x1="0" y1={start.y} x2={width} y2={start.y} stroke="#d0d7de" strokeWidth="1" strokeDasharray="4,4" />
+        <Line x1={start.x} y1="0" x2={start.x} y2={height} stroke="#d0d7de" strokeWidth="1" strokeDasharray="4,4" />
+
         {previousPath && prevPoly.length > 0 && (
           <>
             <Polyline points={prevPoly} fill="none" stroke="#d97706" strokeWidth="3" strokeDasharray="6,4" strokeLinejoin="round" strokeLinecap="round" opacity={0.85} />
@@ -715,27 +757,27 @@ function PathPlot({ points, heading, previousPath }) {
             ))}
             {prevEnd && (
               <SvgText x={prevEnd.x + 8} y={prevEnd.y - 8} fontSize="10" fontWeight="bold" fill="#b45309">
-                PREV ({previousPath.points[previousPath.points.length - 1].x.toFixed(1)}, {previousPath.points[previousPath.points.length - 1].y.toFixed(1)})
+                PREV ({validPrevPoints[validPrevPoints.length - 1].x.toFixed(1)}, {validPrevPoints[validPrevPoints.length - 1].y.toFixed(1)})
               </SvgText>
             )}
           </>
         )}
 
-        {/* Live Active Path */}
-        <Polyline points={poly} fill="none" stroke="#1f6feb" strokeWidth="3.5" strokeLinejoin="round" strokeLinecap="round" />
+        {m.length > 1 && (
+          <Polyline points={poly} fill="none" stroke="#1f6feb" strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />
+        )}
+
         {m.map((pt, i) => (
-          <Circle key={`curr-${i}`} cx={pt.x} cy={pt.y} r={i === m.length - 1 ? 5 : 3} fill={i === m.length - 1 ? "#1f6feb" : "#0969da"} />
+          <Circle key={`curr-${i}`} cx={pt.x} cy={pt.y} r={i === 0 ? 5 : i === m.length - 1 ? 5.5 : 3.5} fill={i === 0 ? "#1a7f37" : i === m.length - 1 ? "#1f6feb" : "#0969da"} />
         ))}
 
-        {/* Start Position Marker */}
-        <Circle cx={start.x} cy={start.y} r="6" fill="#1a7f37" />
+        <Circle cx={start.x} cy={start.y} r="6" fill="#1a7f37" stroke="#ffffff" strokeWidth="1.5" />
         <SvgText x={start.x + 8} y={start.y - 6} fontSize="11" fontWeight="bold" fill="#1a7f37">START (0,0)</SvgText>
 
-        {/* Live Facing Direction Pointer & Current Marker */}
         <Polygon points={arrowPolygon} fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
-        <Circle cx={end.x} cy={end.y} r="5" fill="#cf222e" />
+        <Circle cx={end.x} cy={end.y} r="5" fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
         <SvgText x={end.x + 8} y={end.y + 14} fontSize="11" fontWeight="bold" fill="#cf222e">
-          NOW ({points[points.length - 1].x.toFixed(1)}, {points[points.length - 1].y.toFixed(1)})
+          NOW ({lastPt.x.toFixed(1)}, {lastPt.y.toFixed(1)})
         </SvgText>
       </Svg>
     </View>
