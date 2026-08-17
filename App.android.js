@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   SafeAreaView,
   View,
@@ -17,39 +17,31 @@ import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./
 import BleScannerSection from "./components/BleScannerSection.js";
 import OtaUpdateCard from "./components/OtaUpdateCard.js";
 
-// Helper angle utilities
 const norm = d => {
-  if (typeof d !== "number" || isNaN(d)) return 0;
   let x = d % 360;
   if (x < 0) x += 360;
   return x;
 };
 
-const radToDeg = r => (r * 180) / Math.PI;
-
-// Sensitivity presets for peak-valley step detection (in g)
-const SENSITIVITY_PRESETS = {
-  high: { peak: 0.09, valley: -0.05, minDelay: 260, label: "High" },
-  medium: { peak: 0.13, valley: -0.07, minDelay: 290, label: "Medium (Default)" },
-  low: { peak: 0.18, valley: -0.10, minDelay: 330, label: "Low" }
+const signed = d => {
+  let x = norm(d);
+  if (x > 180) x -= 360;
+  return x;
 };
 
-const WEINBERG_K = 0.74; // Calibrated for acceleration in g units
-const LPF_HEADING = 0.22; // Low-pass filter for heading smoothing
+const alphaDeg = a => (Math.abs(a) <= Math.PI * 2.2 ? (a * 180) / Math.PI : a);
 
 export default function AppAndroid() {
   const [running, setRunning] = useState(false);
   const [available, setAvailable] = useState("checking...");
   const [steps, setSteps] = useState(0);
-  const [currentStepLength, setCurrentStepLength] = useState(0.70);
+  const [stepLength, setStepLength] = useState(0.70);
   const [heading, setHeading] = useState(0);
+  const [headingZero, setHeadingZero] = useState(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [path, setPath] = useState([{ x: 0, y: 0 }]);
   const [status, setStatus] = useState("Ready (Android)");
-  const [stepSensitivity, setStepSensitivity] = useState("medium");
-  const [autoStepLenEnabled, setAutoStepLenEnabled] = useState(true);
-  const [fixedStepLength, setFixedStepLength] = useState(0.70);
-  const [liveDynAccel, setLiveDynAccel] = useState(0);
+  const [rawHeading, setRawHeading] = useState(0);
 
   const [magneticField, setMagneticField] = useState({ x: 0, y: 0, z: 0, total: 0 });
 
@@ -60,27 +52,15 @@ export default function AppAndroid() {
   // Mode switch: 'pdr' | 'ble'
   const [activeTab, setActiveTab] = useState("pdr");
 
-  // High frequency mutable state kept in refs
   const runningRef = useRef(false);
-  const rawHeadingRef = useRef(0);
+  const headingRef = useRef(0);
   const headingZeroRef = useRef(null);
-  const smoothedHeadingRef = useRef(0); // in degrees [-180, 180]
+  const smoothedHeadingRef = useRef(0);
   const positionRef = useRef({ x: 0, y: 0 });
   const stepLengthRef = useRef(0.70);
-  const stepCountRef = useRef(0);
-  const pathRef = useRef([{ x: 0, y: 0 }]);
-  const hasDeviceMotionRotationRef = useRef(false);
-
-  // Accelerometer FSM Peak-Valley Step Detector Refs
-  const gravityRef = useRef(1.0);
-  const filteredDynAccelRef = useRef(0);
-  const stepStateRef = useRef("IDLE"); // 'IDLE' | 'PEAK_DETECTED' | 'VALLEY_DETECTED'
   const lastStepTimeRef = useRef(0);
-  const stepPeakMaxRef = useRef(0);
-  const stepValleyMinRef = useRef(0);
-  const sensitivityRef = useRef(SENSITIVITY_PRESETS.medium);
-
-  const magFieldRef = useRef({ x: 0, y: 0, z: 0, total: 0 });
+  const gravityRef = useRef(1.0);
+  const hasMotionRotationRef = useRef(false);
 
   // Load saved paths on mount
   useEffect(() => {
@@ -92,109 +72,35 @@ export default function AppAndroid() {
     setSavedPaths(list);
   };
 
-  // Sync sensitivity ref when state changes
-  useEffect(() => {
-    sensitivityRef.current = SENSITIVITY_PRESETS[stepSensitivity] || SENSITIVITY_PRESETS.medium;
-  }, [stepSensitivity]);
+  // Add a step and update position & path
+  const addStep = (customLen = null) => {
+    const len = customLen || stepLengthRef.current || 0.70;
+    const curHeading = headingRef.current || 0;
+    const rad = (curHeading * Math.PI) / 180;
+    const old = positionRef.current;
 
-  // Heading calculation helper that works for both DeviceMotion and Magnetometer
-  const updateHeadingFromRaw = useCallback((rawDeg) => {
-    if (typeof rawDeg !== "number" || isNaN(rawDeg)) return;
-    rawHeadingRef.current = rawDeg;
-
-    if (headingZeroRef.current === null) return;
-
-    // Delta relative to zero calibration
-    const deltaRaw = norm(headingZeroRef.current - rawDeg);
-    const targetHeading = deltaRaw > 180 ? deltaRaw - 360 : deltaRaw;
-    if (isNaN(targetHeading)) return;
-
-    let current = smoothedHeadingRef.current;
-    if (!isFinite(current)) current = 0;
-
-    let diff = targetHeading - current;
-    while (diff > 180) diff -= 360;
-    while (diff < -180) diff += 360;
-
-    let updated = current + LPF_HEADING * diff;
-    if (updated > 180) updated -= 360;
-    if (updated < -180) updated += 360;
-
-    smoothedHeadingRef.current = Number(updated.toFixed(2));
-  }, []);
-
-  // --------------------------------------------------------------------------
-  // Core Step Registration Function (Bulletproof against NaN)
-  // --------------------------------------------------------------------------
-  const recordStep = useCallback((dynamicLen = null) => {
-    let len = fixedStepLength;
-    if (autoStepLenEnabled && typeof dynamicLen === "number" && isFinite(dynamicLen) && dynamicLen >= 0.45 && dynamicLen <= 1.15) {
-      len = dynamicLen;
-    }
-    if (!isFinite(len) || len <= 0) len = 0.70;
-
-    stepLengthRef.current = len;
-
-    let thetaDeg = smoothedHeadingRef.current;
-    if (!isFinite(thetaDeg)) thetaDeg = 0;
-
-    const thetaRad = (thetaDeg * Math.PI) / 180;
-    const old = positionRef.current || { x: 0, y: 0 };
-    const oldX = isFinite(old.x) ? old.x : 0;
-    const oldY = isFinite(old.y) ? old.y : 0;
-
-    // Standard Cartesian navigation frame:
-    // Heading 0 deg = +Y (Forward/North)
-    // Heading +90 deg = +X (Right/East)
-    // Heading -90 deg = -X (Left/West)
-    // Heading 180 deg = -Y (Backward/South)
-    const nextX = Number((oldX + len * Math.sin(thetaRad)).toFixed(3));
-    const nextY = Number((oldY + len * Math.cos(thetaRad)).toFixed(3));
-
+    // Standard Navigation coordinates:
+    // Heading 0° = +Y (Forward/North)
+    // Heading +90° = +X (Right/East)
+    // Heading -90° = -X (Left/West)
+    // Heading 180° = -Y (Backward/South)
     const next = {
-      x: isFinite(nextX) ? nextX : oldX,
-      y: isFinite(nextY) ? nextY : oldY
+      x: Number((old.x + len * Math.sin(rad)).toFixed(2)),
+      y: Number((old.y + len * Math.cos(rad)).toFixed(2))
     };
 
     positionRef.current = next;
-    stepCountRef.current = (stepCountRef.current || 0) + 1;
-    const count = stepCountRef.current;
-
-    const updatedPath = [...pathRef.current, next];
-    pathRef.current = updatedPath;
-
     setPosition(next);
-    setSteps(count);
-    setCurrentStepLength(len);
-    setPath(updatedPath);
-
-    console.log(`[Android PDR Step #${count}] SL=${len.toFixed(2)}m | Heading=${thetaDeg.toFixed(1)}° | Pos=(${next.x}, ${next.y}) | PathPts=${updatedPath.length}`);
-  }, [autoStepLenEnabled, fixedStepLength]);
-
-  // Weinberg step length estimator based on vertical acceleration bounce
-  const computeWeinbergLength = useCallback((maxA, minA) => {
-    if (!isFinite(maxA) || !isFinite(minA)) return 0.70;
-    const bounceDiff = Math.max(0.12, maxA - minA);
-    const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
-    if (!isFinite(estimated)) return 0.70;
-    return Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
-  }, []);
+    setPath(p => [...p, next]);
+    setSteps(s => {
+      const nextCount = s + 1;
+      console.log(`[PDR Step #${nextCount}] Heading: ${curHeading.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
+      return nextCount;
+    });
+  };
 
   // --------------------------------------------------------------------------
-  // Throttled UI State Sync Loop (100ms) - Keeps React rendering smooth at 10Hz
-  // --------------------------------------------------------------------------
-  useEffect(() => {
-    const uiSyncTimer = setInterval(() => {
-      const curHeading = isFinite(smoothedHeadingRef.current) ? smoothedHeadingRef.current : 0;
-      setHeading(curHeading);
-      setMagneticField(magFieldRef.current);
-      setLiveDynAccel(Number((filteredDynAccelRef.current || 0).toFixed(3)));
-    }, 100);
-    return () => clearInterval(uiSyncTimer);
-  }, []);
-
-  // --------------------------------------------------------------------------
-  // Hardware Sensor Subscriptions
+  // Hardware Sensors (Accelerometer Step Detection + Heading)
   // --------------------------------------------------------------------------
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
@@ -202,12 +108,11 @@ export default function AppAndroid() {
 
     (async () => {
       try {
-        // Request Android Activity Recognition runtime permission
         if (Platform.OS === "android" && Platform.Version >= 29) {
           try {
             await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACTIVITY_RECOGNITION);
           } catch (pe) {
-            console.warn("Activity recognition permission error:", pe);
+            console.warn("Activity recognition error:", pe);
           }
         }
 
@@ -218,112 +123,87 @@ export default function AppAndroid() {
         ]);
 
         if (!isMounted) return;
-
-        setAvailable(`Motion: ${mAvail ? "✓" : "✗"} | Mag: ${magAvail ? "✓" : "✗"} | Pedometer: ${pAvail ? "✓" : "✗"}`);
+        setAvailable(`Sensors: Motion ${mAvail ? "✓" : "✗"} • Mag ${magAvail ? "✓" : "✗"} • Pedometer ${pAvail ? "✓" : "✗"}`);
 
         if (mAvail) await DeviceMotion.requestPermissionsAsync().catch(() => {});
         if (magAvail) await Magnetometer.requestPermissionsAsync().catch(() => {});
         if (pAvail) await Pedometer.requestPermissionsAsync().catch(() => {});
 
-        // 1. Magnetometer Listener (40ms = 25Hz)
-        Magnetometer.setUpdateInterval(40);
+        // 1. Magnetometer (Compass Azimuth + Diagnostics)
+        Magnetometer.setUpdateInterval(50);
         magSub = Magnetometer.addListener(data => {
           if (!data) return;
           const { x, y, z } = data;
-          if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return;
-
           const totalField = Math.sqrt(x * x + y * y + z * z);
-          magFieldRef.current = {
+          setMagneticField({
             x: Number(x.toFixed(1)),
             y: Number(y.toFixed(1)),
             z: Number(z.toFixed(1)),
-            total: Number((isFinite(totalField) ? totalField : 0).toFixed(1))
-          };
+            total: Number(totalField.toFixed(1))
+          });
 
-          // Compute 2D Compass Azimuth
-          let compassDeg = Math.atan2(-x, y) * (180 / Math.PI);
-          if (isNaN(compassDeg)) compassDeg = 0;
-          compassDeg = norm(compassDeg);
+          // If DeviceMotion rotation is not active on this device, use Magnetometer compass
+          if (!hasMotionRotationRef.current) {
+            let magDeg = Math.atan2(-x, y) * (180 / Math.PI);
+            magDeg = norm(magDeg);
+            setRawHeading(magDeg);
 
-          // If DeviceMotion rotation is not available or not active, use Magnetometer
-          if (!hasDeviceMotionRotationRef.current) {
-            updateHeadingFromRaw(compassDeg);
+            if (headingZeroRef.current !== null) {
+              const rel = signed(headingZeroRef.current - magDeg);
+              headingRef.current = rel;
+              setHeading(rel);
+            }
           }
         });
 
-        // 2. DeviceMotion / Orientation Listener (40ms = 25Hz)
-        DeviceMotion.setUpdateInterval(40);
+        // 2. DeviceMotion / Rotation
+        DeviceMotion.setUpdateInterval(50);
         motionSub = DeviceMotion.addListener(data => {
-          if (!data) return;
+          if (!data?.rotation?.alpha) return;
+          hasMotionRotationRef.current = true;
+          const raw = norm(alphaDeg(data.rotation.alpha));
+          setRawHeading(raw);
 
-          if (data.rotation && typeof data.rotation.alpha === "number" && isFinite(data.rotation.alpha)) {
-            hasDeviceMotionRotationRef.current = true;
-            const alpha = data.rotation.alpha;
-            let rawDeg = Math.abs(alpha) <= Math.PI * 2.2 ? radToDeg(alpha) : alpha;
-            if (isNaN(rawDeg)) return;
-            rawDeg = norm(rawDeg);
-            updateHeadingFromRaw(rawDeg);
+          if (headingZeroRef.current !== null) {
+            // Android rotation alpha convention
+            const rel = signed(headingZeroRef.current - raw);
+            let diff = rel - smoothedHeadingRef.current;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+
+            smoothedHeadingRef.current = norm(smoothedHeadingRef.current + 0.25 * diff);
+            const formatted = signed(smoothedHeadingRef.current);
+            headingRef.current = formatted;
+            setHeading(formatted);
           }
         });
 
-        // 3. Real-Time High-Precision Accelerometer Peak-Valley Step Detector (20ms = 50Hz)
-        Accelerometer.setUpdateInterval(20);
+        // 3. Simple & Robust Accelerometer Step Detector
+        Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
-          if (!data) return;
-          const { x, y, z } = data;
-          if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return;
-
-          const rawMag = Math.sqrt(x * x + y * y + z * z); // in g
-          if (!isFinite(rawMag)) return;
-
-          // Update dynamic gravity baseline (low-pass filter)
-          gravityRef.current = 0.95 * gravityRef.current + 0.05 * rawMag;
-          const dynAccel = rawMag - gravityRef.current;
-
-          // Filter dynamic acceleration to eliminate high-frequency jitter
-          filteredDynAccelRef.current += 0.35 * (dynAccel - filteredDynAccelRef.current);
-          const filtered = filteredDynAccelRef.current;
-
           if (!runningRef.current) return;
+          const { x, y, z } = data;
+          const mag = Math.sqrt(x * x + y * y + z * z); // in g
+
+          // Dynamic gravity baseline
+          gravityRef.current = 0.94 * gravityRef.current + 0.06 * mag;
+          const dynamicAccel = Math.abs(mag - gravityRef.current);
 
           const now = Date.now();
-          const cfg = sensitivityRef.current;
-
-          // Finite State Machine for Step Detection
-          if (stepStateRef.current === "IDLE") {
-            if (filtered > cfg.peak && (now - lastStepTimeRef.current) > cfg.minDelay) {
-              stepStateRef.current = "PEAK_DETECTED";
-              stepPeakMaxRef.current = rawMag;
-              stepValleyMinRef.current = rawMag;
-            }
-          } else if (stepStateRef.current === "PEAK_DETECTED") {
-            if (rawMag > stepPeakMaxRef.current) {
-              stepPeakMaxRef.current = rawMag;
-            }
-            if (filtered < cfg.valley) {
-              stepStateRef.current = "VALLEY_DETECTED";
-              stepValleyMinRef.current = rawMag;
-            }
-          } else if (stepStateRef.current === "VALLEY_DETECTED") {
-            if (rawMag < stepValleyMinRef.current) {
-              stepValleyMinRef.current = rawMag;
-            }
-            if (filtered > -0.02) {
-              const dt = now - lastStepTimeRef.current;
-              if (dt >= cfg.minDelay && dt <= 1400) {
-                lastStepTimeRef.current = now;
-                const autoLen = computeWeinbergLength(stepPeakMaxRef.current, stepValleyMinRef.current);
-                recordStep(autoLen);
-              }
-              stepStateRef.current = "IDLE";
-            }
+          // Trigger step on impact peak with minimum step delay (300ms)
+          if (dynamicAccel > 0.16 && (now - lastStepTimeRef.current) > 300) {
+            lastStepTimeRef.current = now;
+            addStep();
           }
+        });
+
+        // 4. Hardware Pedometer backup
+        pedSub = Pedometer.watchStepCount(result => {
+          // Additional step listener if available
         });
 
       } catch (e) {
-        if (isMounted) {
-          setStatus("Android Sensor error: " + (e?.message || String(e)));
-        }
+        if (isMounted) setStatus("Sensor Error: " + (e?.message || String(e)));
       }
     })();
 
@@ -334,73 +214,70 @@ export default function AppAndroid() {
       accelSub?.remove?.();
       magSub?.remove?.();
     };
-  }, [recordStep, computeWeinbergLength, updateHeadingFromRaw]);
+  }, []);
 
   // --------------------------------------------------------------------------
-  // User Actions & Controls
+  // User Actions
   // --------------------------------------------------------------------------
   const setZero = () => {
-    const raw = isFinite(rawHeadingRef.current) ? rawHeadingRef.current : 0;
-    headingZeroRef.current = raw;
+    headingZeroRef.current = rawHeading;
+    setHeadingZero(rawHeading);
     smoothedHeadingRef.current = 0;
+    headingRef.current = 0;
     setHeading(0);
     setStatus("Heading zero calibrated (Forward = 0°)");
   };
 
   const start = () => {
     if (headingZeroRef.current === null) {
-      const raw = isFinite(rawHeadingRef.current) ? rawHeadingRef.current : 0;
-      headingZeroRef.current = raw;
+      headingZeroRef.current = rawHeading;
+      setHeadingZero(rawHeading);
       smoothedHeadingRef.current = 0;
+      headingRef.current = 0;
       setHeading(0);
     }
     runningRef.current = true;
     setRunning(true);
-    setStatus("Recording Android PDR path...");
+    setStatus("Recording PDR path...");
   };
 
   const stop = () => {
     runningRef.current = false;
     setRunning(false);
-    setStatus("Tracking paused");
+    setStatus("Tracking stopped");
   };
 
   const reset = () => {
     runningRef.current = false;
     setRunning(false);
-    stepCountRef.current = 0;
     setSteps(0);
     positionRef.current = { x: 0, y: 0 };
-    pathRef.current = [{ x: 0, y: 0 }];
     setPosition({ x: 0, y: 0 });
     setPath([{ x: 0, y: 0 }]);
-    stepStateRef.current = "IDLE";
-    setStatus("Reset to origin (0,0)");
+    setStatus("Reset to (0,0)");
   };
 
   const closeLoop = () => {
-    const curPath = pathRef.current;
-    if (!curPath || curPath.length <= 2) {
+    if (path.length <= 2) {
       Alert.alert("Loop Closure Error", "Walk a closed loop path before applying loop closure.");
       return;
     }
-    const lastPt = curPath[curPath.length - 1];
-    const totalSteps = curPath.length - 1;
+    const lastPt = path[path.length - 1];
+    const totalSteps = path.length - 1;
     const dx = lastPt.x / totalSteps;
     const dy = lastPt.y / totalSteps;
 
-    const correctedPath = curPath.map((pt, i) => ({
-      x: Number((pt.x - dx * i).toFixed(3)),
-      y: Number((pt.y - dy * i).toFixed(3))
+    const correctedPath = path.map((pt, i) => ({
+      x: Number((pt.x - dx * i).toFixed(2)),
+      y: Number((pt.y - dy * i).toFixed(2))
     }));
 
     const finalPos = correctedPath[correctedPath.length - 1];
     positionRef.current = finalPos;
-    pathRef.current = correctedPath;
     setPosition(finalPos);
     setPath(correctedPath);
     setStatus("Loop Closure Applied! Drift eliminated.");
-    Alert.alert("Android Loop Closure", `Corrected drift of X: ${lastPt.x.toFixed(2)}m, Y: ${lastPt.y.toFixed(2)}m back to origin.`);
+    Alert.alert("Loop Closure Complete", `Corrected drift of X: ${lastPt.x.toFixed(2)}m, Y: ${lastPt.y.toFixed(2)}m back to origin.`);
   };
 
   const handleSavePath = async () => {
@@ -408,7 +285,7 @@ export default function AppAndroid() {
       Alert.alert("Cannot Save Path", "Walk a path first before saving.");
       return;
     }
-    const totalDist = steps * currentStepLength;
+    const totalDist = steps * stepLength;
     try {
       const updated = await savePath({
         steps,
@@ -465,13 +342,13 @@ export default function AppAndroid() {
     ]);
   };
 
-  const dist = steps * currentStepLength;
+  const dist = steps * stepLength;
 
   return (
     <SafeAreaView style={s.safe}>
       <ScrollView contentContainerStyle={s.container}>
         <Text style={s.title}>Indoor PDR Navigation</Text>
-        <Text style={s.sub}>Real-Time FSM Peak-Valley Detector • Smooth Dead Reckoning</Text>
+        <Text style={s.sub}>Real-Time Step Tracking • Compass & Gyro Heading • 2D Map</Text>
 
         {/* Section Switcher Tabs */}
         <View style={s.tabContainer}>
@@ -499,7 +376,7 @@ export default function AppAndroid() {
           <>
             <View style={s.card}>
               <Text style={s.label}>Hardware Sensors Status</Text>
-              <Text style={s.sensorAvailText}>{available}</Text>
+              <Text style={{ fontSize: 13, color: "#24292f" }}>{available}</Text>
               <Text style={s.status}>{status}</Text>
             </View>
 
@@ -515,38 +392,44 @@ export default function AppAndroid() {
 
             <View style={s.row}>
               <Metric label="Total Distance" value={`${dist.toFixed(2)} m`} />
-              <Metric label="Step Length" value={`${currentStepLength.toFixed(2)} m`} />
+              <Metric label="Step Length" value={`${stepLength.toFixed(2)} m`} />
             </View>
 
-            {/* Sensitivity & Step Length Settings */}
+            {/* Step Length Adjuster & Test Step Button */}
             <View style={s.card}>
-              <Text style={s.label}>Step Detection Sensitivity</Text>
-              <View style={s.sensitivityRow}>
-                {["high", "medium", "low"].map((mode) => (
-                  <Pressable
-                    key={mode}
-                    onPress={() => setStepSensitivity(mode)}
-                    style={[s.sensBtn, stepSensitivity === mode && s.sensBtnActive]}
-                  >
-                    <Text style={[s.sensBtnText, stepSensitivity === mode && s.sensBtnTextActive]}>
-                      {SENSITIVITY_PRESETS[mode].label}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
-                <Text style={{ fontSize: 12, color: "#57606a" }}>
-                  Live Accel Dyn: <Text style={{ fontFamily: "monospace", fontWeight: "700", color: "#1f6feb" }}>{liveDynAccel > 0 ? `+${liveDynAccel}` : liveDynAccel}g</Text>
-                </Text>
+              <Text style={s.label}>Step Length Configuration & Test</Text>
+              <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
                 <Pressable
-                  onPress={() => setAutoStepLenEnabled(!autoStepLenEnabled)}
-                  style={[s.toggleBtn, autoStepLenEnabled ? s.toggleBtnOn : s.toggleBtnOff]}
+                  onPress={() => {
+                    const nextLen = Number(Math.max(0.40, stepLength - 0.05).toFixed(2));
+                    setStepLength(nextLen);
+                    stepLengthRef.current = nextLen;
+                  }}
+                  style={s.stepAdjustBtn}
                 >
-                  <Text style={[s.toggleBtnText, autoStepLenEnabled && { color: "white" }]}>
-                    {autoStepLenEnabled ? "Auto Weinberg SL: ON" : "Fixed SL: 0.70m"}
-                  </Text>
+                  <Text style={s.stepAdjustText}>- 0.05m</Text>
+                </Pressable>
+                <View style={{ flex: 1, alignItems: "center" }}>
+                  <Text style={{ fontSize: 16, fontWeight: "800", color: "#1f6feb" }}>{stepLength.toFixed(2)} m</Text>
+                </View>
+                <Pressable
+                  onPress={() => {
+                    const nextLen = Number(Math.min(1.20, stepLength + 0.05).toFixed(2));
+                    setStepLength(nextLen);
+                    stepLengthRef.current = nextLen;
+                  }}
+                  style={s.stepAdjustBtn}
+                >
+                  <Text style={s.stepAdjustText}>+ 0.05m</Text>
                 </Pressable>
               </View>
+              {/* Test Manual Step Button */}
+              <Pressable
+                onPress={() => addStep()}
+                style={s.manualStepBtn}
+              >
+                <Text style={s.manualStepBtnText}>👣 Add Test Step Manually</Text>
+              </Pressable>
             </View>
 
             {/* 2D Path Map with Live Orientation Arrow */}
@@ -555,7 +438,7 @@ export default function AppAndroid() {
             {/* Main Action Buttons */}
             <View style={s.row}>
               <Btn text="Set Heading Zero" onPress={setZero} />
-              <Btn text={running ? "Stop" : "Start Tracking"} onPress={running ? stop : start} strong />
+              <Btn text={running ? "Stop Tracking" : "Start Tracking"} onPress={running ? stop : start} strong />
             </View>
 
             <View style={s.row}>
@@ -638,9 +521,9 @@ export default function AppAndroid() {
             <View style={s.card}>
               <Text style={s.label}>Android Guide</Text>
               <Text style={s.help}>
-                • Hold phone flat, top of phone pointed forward in the direction you are walking.{"\n"}
-                • Tap "Set Heading Zero" while facing forward, then tap "Start Tracking".{"\n"}
-                • Accelerometer FSM will register each step dynamically without pedometer lag.
+                1. Face the direction you want to walk and tap "Set Heading Zero".{"\n"}
+                2. Tap "Start Tracking" and begin walking.{"\n"}
+                3. The blue line and red orientation pointer will draw your path live on the map.
               </Text>
             </View>
           </>
@@ -676,118 +559,98 @@ function PathPlot({ points, heading, previousPath }) {
   const height = 340;
   const pad = 40;
 
-  // Filter valid points only
-  const validPoints = (Array.isArray(points) ? points : [{ x: 0, y: 0 }])
-    .filter(p => p && typeof p.x === "number" && typeof p.y === "number" && isFinite(p.x) && isFinite(p.y));
-  const pts = validPoints.length > 0 ? validPoints : [{ x: 0, y: 0 }];
-
-  const validPrevPoints = (previousPath?.points && Array.isArray(previousPath.points) ? previousPath.points : [])
-    .filter(p => p && typeof p.x === "number" && typeof p.y === "number" && isFinite(p.x) && isFinite(p.y));
-
-  const allPts = [...pts, ...validPrevPoints];
+  const validPts = (points && points.length > 0) ? points : [{ x: 0, y: 0 }];
+  let allPts = [...validPts];
+  if (previousPath?.points?.length > 0) {
+    allPts = [...allPts, ...previousPath.points];
+  }
 
   let minX = 0, maxX = 0, minY = 0, maxY = 0;
   allPts.forEach(p => {
-    minX = Math.min(minX, p.x);
-    maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y);
-    maxY = Math.max(maxY, p.y);
+    if (typeof p?.x === "number") {
+      minX = Math.min(minX, p.x);
+      maxX = Math.max(maxX, p.x);
+    }
+    if (typeof p?.y === "number") {
+      minY = Math.min(minY, p.y);
+      maxY = Math.max(maxY, p.y);
+    }
   });
 
-  const spanX = Math.max(3.0, (maxX - minX) * 1.25);
-  const spanY = Math.max(3.0, (maxY - minY) * 1.25);
+  const spanX = Math.max(4.0, maxX - minX);
+  const spanY = Math.max(4.0, maxY - minY);
   const scale = Math.min((width - pad * 2) / spanX, (height - pad * 2) / spanY);
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
 
-  // Map real-world Cartesian (m) to SVG Canvas (pixels)
-  const map = p => {
-    const px = (p && isFinite(p.x)) ? p.x : 0;
-    const py = (p && isFinite(p.y)) ? p.y : 0;
-    return {
-      x: Number((width / 2 + (px - cx) * scale).toFixed(1)),
-      y: Number((height / 2 - (py - cy) * scale).toFixed(1))
-    };
-  };
+  const map = p => ({
+    x: Number((width / 2 + (p.x - cx) * scale).toFixed(1)),
+    y: Number((height / 2 - (p.y - cy) * scale).toFixed(1))
+  });
 
-  const m = pts.map(map);
+  const m = validPts.map(map);
   const poly = m.map(p => `${p.x},${p.y}`).join(" ");
   const start = map({ x: 0, y: 0 });
   const end = m[m.length - 1] || start;
 
-  let prevM = [], prevPoly = "", prevEnd = null;
-  if (validPrevPoints.length > 0) {
-    prevM = validPrevPoints.map(map);
-    prevPoly = prevM.map(p => `${p.x},${p.y}`).join(" ");
-    prevEnd = prevM[prevM.length - 1];
-  }
-
-  // Calculate live heading arrow points at user's current position (end)
-  const safeHeading = isFinite(heading) ? heading : 0;
-  const headingRad = (safeHeading * Math.PI) / 180;
-  const arrowLength = 18;
-  const arrowWingDist = 10;
-  const arrowAngleSpread = 2.4; // radians (~137 degrees)
-
+  // Direction pointer arrow at current position
+  const safeHeading = typeof heading === "number" && !isNaN(heading) ? heading : 0;
+  const rad = (safeHeading * Math.PI) / 180;
+  const arrowLen = 18;
   const tip = {
-    x: Number((end.x + arrowLength * Math.sin(headingRad)).toFixed(1)),
-    y: Number((end.y - arrowLength * Math.cos(headingRad)).toFixed(1))
+    x: Number((end.x + arrowLen * Math.sin(rad)).toFixed(1)),
+    y: Number((end.y - arrowLen * Math.cos(rad)).toFixed(1))
   };
-  const leftWing = {
-    x: Number((end.x + arrowWingDist * Math.sin(headingRad - arrowAngleSpread)).toFixed(1)),
-    y: Number((end.y - arrowWingDist * Math.cos(headingRad - arrowAngleSpread)).toFixed(1))
+  const left = {
+    x: Number((end.x + 10 * Math.sin(rad - 2.4)).toFixed(1)),
+    y: Number((end.y - 10 * Math.cos(rad - 2.4)).toFixed(1))
   };
-  const rightWing = {
-    x: Number((end.x + arrowWingDist * Math.sin(headingRad + arrowAngleSpread)).toFixed(1)),
-    y: Number((end.y - arrowWingDist * Math.cos(headingRad + arrowAngleSpread)).toFixed(1))
+  const right = {
+    x: Number((end.x + 10 * Math.sin(rad + 2.4)).toFixed(1)),
+    y: Number((end.y - 10 * Math.cos(rad + 2.4)).toFixed(1))
   };
-  const arrowPolygon = `${tip.x},${tip.y} ${leftWing.x},${leftWing.y} ${end.x},${end.y} ${rightWing.x},${rightWing.y}`;
+  const arrowPoly = `${tip.x},${tip.y} ${left.x},${left.y} ${end.x},${end.y} ${right.x},${right.y}`;
 
-  const lastPt = pts[pts.length - 1] || { x: 0, y: 0 };
+  const lastPt = validPts[validPts.length - 1] || { x: 0, y: 0 };
 
   return (
     <View style={s.plot}>
-      <Text style={s.label}>Live PDR Walk Route Map (Android)</Text>
+      <Text style={s.label}>Live PDR Walk Route Map</Text>
 
-      {/* Map Legend */}
       <View style={s.legendRow}>
         <View style={s.legendItem}>
           <View style={[s.legendColor, { backgroundColor: "#1f6feb" }]} />
-          <Text style={s.legendText}>Route ({pts.length} pts)</Text>
+          <Text style={s.legendText}>Route ({validPts.length} pts)</Text>
         </View>
         <View style={s.legendItem}>
           <View style={[s.legendColor, { backgroundColor: "#cf222e" }]} />
-          <Text style={s.legendText}>Live Heading ({safeHeading.toFixed(0)}°)</Text>
+          <Text style={s.legendText}>Facing ({safeHeading.toFixed(0)}°)</Text>
         </View>
         {previousPath && (
           <View style={s.legendItem}>
             <View style={[s.legendColor, { backgroundColor: "#d97706" }]} />
-            <Text style={s.legendText}>Previous Path</Text>
+            <Text style={s.legendText}>Previous ({previousPath.name})</Text>
           </View>
         )}
       </View>
 
       <Svg width={width} height={height}>
-        {/* Background Grid Canvas */}
         <Rect x="0" y="0" width={width} height={height} fill="#fafbfc" rx="10" />
 
-        {/* Origin Axes Grid Lines */}
+        {/* Origin Axes Lines */}
         <Line x1="0" y1={start.y} x2={width} y2={start.y} stroke="#d0d7de" strokeWidth="1" strokeDasharray="4,4" />
         <Line x1={start.x} y1="0" x2={start.x} y2={height} stroke="#d0d7de" strokeWidth="1" strokeDasharray="4,4" />
 
         {/* Previous Saved Path Overlay */}
-        {previousPath && prevPoly.length > 0 && (
-          <>
-            <Polyline points={prevPoly} fill="none" stroke="#d97706" strokeWidth="3" strokeDasharray="6,4" strokeLinejoin="round" strokeLinecap="round" opacity={0.85} />
-            {prevM.map((pt, i) => (
-              <Circle key={`prev-${i}`} cx={pt.x} cy={pt.y} r={i === prevM.length - 1 ? 4.5 : 2.5} fill="#d97706" opacity={0.85} />
-            ))}
-            {prevEnd && (
-              <SvgText x={prevEnd.x + 8} y={prevEnd.y - 8} fontSize="10" fontWeight="bold" fill="#b45309">
-                PREV ({validPrevPoints[validPrevPoints.length - 1].x.toFixed(1)}, {validPrevPoints[validPrevPoints.length - 1].y.toFixed(1)})
-              </SvgText>
-            )}
-          </>
+        {previousPath?.points?.length > 0 && (
+          <Polyline
+            points={previousPath.points.map(map).map(p => `${p.x},${p.y}`).join(" ")}
+            fill="none"
+            stroke="#d97706"
+            strokeWidth="3"
+            strokeDasharray="6,4"
+            opacity={0.8}
+          />
         )}
 
         {/* Live Active Path Polyline */}
@@ -797,15 +660,15 @@ function PathPlot({ points, heading, previousPath }) {
 
         {/* Waypoint Circles */}
         {m.map((pt, i) => (
-          <Circle key={`curr-${i}`} cx={pt.x} cy={pt.y} r={i === 0 ? 5 : i === m.length - 1 ? 5.5 : 3.5} fill={i === 0 ? "#1a7f37" : i === m.length - 1 ? "#1f6feb" : "#0969da"} />
+          <Circle key={i} cx={pt.x} cy={pt.y} r={i === 0 ? 5 : i === m.length - 1 ? 5.5 : 3.5} fill={i === 0 ? "#1a7f37" : "#1f6feb"} />
         ))}
 
         {/* Start Position Marker */}
         <Circle cx={start.x} cy={start.y} r="6" fill="#1a7f37" stroke="#ffffff" strokeWidth="1.5" />
         <SvgText x={start.x + 8} y={start.y - 6} fontSize="11" fontWeight="bold" fill="#1a7f37">START (0,0)</SvgText>
 
-        {/* Live Facing Direction Arrow Pointer */}
-        <Polygon points={arrowPolygon} fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
+        {/* Live Direction Pointer & Current Position Marker */}
+        <Polygon points={arrowPoly} fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
         <Circle cx={end.x} cy={end.y} r="5" fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
         <SvgText x={end.x + 8} y={end.y + 14} fontSize="11" fontWeight="bold" fill="#cf222e">
           NOW ({lastPt.x.toFixed(1)}, {lastPt.y.toFixed(1)})
@@ -823,7 +686,6 @@ const s = StyleSheet.create({
   card: { backgroundColor: "white", borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: "#d0d7de" },
   plot: { backgroundColor: "white", borderRadius: 14, paddingTop: 14, marginBottom: 12, borderWidth: 1, borderColor: "#d0d7de", alignItems: "center" },
   label: { fontWeight: "700", color: "#57606a", marginBottom: 6, fontSize: 13 },
-  sensorAvailText: { fontSize: 13, color: "#24292f", fontFamily: "monospace" },
   status: { marginTop: 4, color: "#0969da", fontWeight: "600", fontSize: 13 },
   row: { flexDirection: "row", gap: 10, marginBottom: 10 },
   metric: { flex: 1, backgroundColor: "white", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#d0d7de" },
@@ -835,16 +697,10 @@ const s = StyleSheet.create({
   btnStrong: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
   btnText: { fontWeight: "700", fontSize: 13 },
 
-  // Sensitivity controls
-  sensitivityRow: { flexDirection: "row", gap: 8, marginTop: 4 },
-  sensBtn: { flex: 1, paddingVertical: 8, borderRadius: 8, borderWidth: 1, borderColor: "#d0d7de", alignItems: "center", backgroundColor: "#f6f8fa" },
-  sensBtnActive: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
-  sensBtnText: { fontSize: 12, fontWeight: "700", color: "#57606a" },
-  sensBtnTextActive: { color: "#ffffff" },
-  toggleBtn: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
-  toggleBtnOn: { backgroundColor: "#0969da", borderColor: "#0969da" },
-  toggleBtnOff: { backgroundColor: "#ffffff", borderColor: "#8c959f" },
-  toggleBtnText: { fontSize: 11, fontWeight: "700", color: "#57606a" },
+  stepAdjustBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#f6f8fa", borderRadius: 8, borderWidth: 1, borderColor: "#d0d7de" },
+  stepAdjustText: { fontSize: 12, fontWeight: "700", color: "#1f6feb" },
+  manualStepBtn: { marginTop: 10, backgroundColor: "#eef5ff", paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: "#54aeff", alignItems: "center" },
+  manualStepBtnText: { fontSize: 13, fontWeight: "700", color: "#0969da" },
 
   // Tab switcher styles
   tabContainer: {
