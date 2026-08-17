@@ -1,32 +1,53 @@
-import React, { useEffect, useRef, useState } from "react";
-import { SafeAreaView, View, Text, Pressable, ScrollView, StyleSheet, Alert, Dimensions } from "react-native";
-import Svg, { Polyline, Circle, Line, Text as SvgText } from "react-native-svg";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import {
+  SafeAreaView,
+  View,
+  Text,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Alert,
+  Dimensions
+} from "react-native";
+import Svg, { Polyline, Circle, Line, Polygon, Text as SvgText } from "react-native-svg";
 import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-sensors";
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import BleScannerSection from "./components/BleScannerSection.js";
+import OtaUpdateCard from "./components/OtaUpdateCard.js";
 
-const norm = d => { let x = d % 360; if (x < 0) x += 360; return x; };
-const signed = d => { let x = norm(d); if (x > 180) x -= 360; return x; };
-const alphaDeg = a => Math.abs(a) <= Math.PI * 2.2 ? a * 180 / Math.PI : a;
+// Helper angle utilities
+const norm = d => {
+  let x = d % 360;
+  if (x < 0) x += 360;
+  return x;
+};
 
-const ACCEL_THRESHOLD = 1.15; // iOS CoreMotion sensitivity
-const ACCEL_MIN_DELAY = 300; 
-const LPF_ALPHA = 0.20; // iOS Gyro low-pass filter
-const WEINBERG_K = 0.45;
+const radToDeg = r => (r * 180) / Math.PI;
+
+// Sensitivity presets for peak-valley step detection (in g)
+const SENSITIVITY_PRESETS = {
+  high: { peak: 0.09, valley: -0.05, minDelay: 260, label: "High" },
+  medium: { peak: 0.13, valley: -0.07, minDelay: 300, label: "Medium (Default)" },
+  low: { peak: 0.18, valley: -0.10, minDelay: 340, label: "Low" }
+};
+
+const WEINBERG_K = 0.74; // Calibrated for acceleration in g units
+const LPF_HEADING = 0.22; // Low-pass filter for heading smoothing
 
 export default function AppIOS() {
   const [running, setRunning] = useState(false);
-  const [available, setAvailable] = useState("checking");
+  const [available, setAvailable] = useState("checking...");
   const [steps, setSteps] = useState(0);
   const [currentStepLength, setCurrentStepLength] = useState(0.70);
-  const [rawHeading, setRawHeading] = useState(0);
   const [heading, setHeading] = useState(0);
-  const [headingZero, setHeadingZero] = useState(null);
-  const [position, setPosition] = useState({x:0,y:0});
-  const [path, setPath] = useState([{x:0,y:0}]);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [path, setPath] = useState([{ x: 0, y: 0 }]);
   const [status, setStatus] = useState("Ready (iOS)");
-  
-  // Magnetic field state (in microteslas μT)
+  const [stepSensitivity, setStepSensitivity] = useState("medium");
+  const [autoStepLenEnabled, setAutoStepLenEnabled] = useState(true);
+  const [fixedStepLength, setFixedStepLength] = useState(0.70);
+  const [liveDynAccel, setLiveDynAccel] = useState(0);
+
   const [magneticField, setMagneticField] = useState({ x: 0, y: 0, z: 0, total: 0 });
 
   // Saved Paths state
@@ -36,15 +57,25 @@ export default function AppIOS() {
   // Mode switch: 'pdr' | 'ble'
   const [activeTab, setActiveTab] = useState("pdr");
 
+  // High frequency mutable state kept in refs to avoid React render lag
   const runningRef = useRef(false);
-  const headingRef = useRef(0);
-  const smoothedHeadingRef = useRef(0);
-  const prevPedRef = useRef(0);
-  const initializedPedRef = useRef(false);
-  const lastStepTimeRef = useRef(0);
-  const positionRef = useRef({x:0,y:0});
+  const rawHeadingRef = useRef(0);
+  const headingZeroRef = useRef(null);
+  const smoothedHeadingRef = useRef(0); // in degrees [-180, 180]
+  const positionRef = useRef({ x: 0, y: 0 });
   const stepLengthRef = useRef(0.70);
-  const stepAccelBufferRef = useRef([]);
+  const stepCountRef = useRef(0);
+
+  // Accelerometer FSM Peak-Valley Step Detector Refs
+  const gravityRef = useRef(1.0);
+  const filteredDynAccelRef = useRef(0);
+  const stepStateRef = useRef("IDLE"); // 'IDLE' | 'PEAK_DETECTED' | 'VALLEY_DETECTED'
+  const lastStepTimeRef = useRef(0);
+  const stepPeakMaxRef = useRef(0);
+  const stepValleyMinRef = useRef(0);
+  const sensitivityRef = useRef(SENSITIVITY_PRESETS.medium);
+
+  const magFieldRef = useRef({ x: 0, y: 0, z: 0, total: 0 });
 
   // Load saved paths on mount
   useEffect(() => {
@@ -56,124 +87,249 @@ export default function AppIOS() {
     setSavedPaths(list);
   };
 
-  const addStep = (dynamicLen = null) => {
-    const len = dynamicLen && dynamicLen >= 0.4 && dynamicLen <= 1.2 ? dynamicLen : stepLengthRef.current;
+  // Sync sensitivity ref when state changes
+  useEffect(() => {
+    sensitivityRef.current = SENSITIVITY_PRESETS[stepSensitivity] || SENSITIVITY_PRESETS.medium;
+  }, [stepSensitivity]);
+
+  // --------------------------------------------------------------------------
+  // Core Step Registration Function
+  // --------------------------------------------------------------------------
+  const recordStep = useCallback((dynamicLen = null) => {
+    const len = autoStepLenEnabled && dynamicLen && dynamicLen >= 0.45 && dynamicLen <= 1.15
+      ? dynamicLen
+      : fixedStepLength;
+
     stepLengthRef.current = len;
-    setCurrentStepLength(len);
 
-    const theta = smoothedHeadingRef.current * Math.PI / 180;
+    const thetaDeg = smoothedHeadingRef.current;
+    const thetaRad = (thetaDeg * Math.PI) / 180;
     const old = positionRef.current;
-    const next = { 
-      x: Number((old.x + len * Math.sin(theta)).toFixed(3)), 
-      y: Number((old.y + len * Math.cos(theta)).toFixed(3)) 
+
+    // Standard Cartesian navigation frame:
+    // Heading 0 deg = +Y (Forward/North)
+    // Heading +90 deg = +X (Right/East)
+    // Heading -90 deg = -X (Left/West)
+    // Heading 180 deg = -Y (Backward/South)
+    const next = {
+      x: Number((old.x + len * Math.sin(thetaRad)).toFixed(3)),
+      y: Number((old.y + len * Math.cos(thetaRad)).toFixed(3))
     };
+
     positionRef.current = next;
+    stepCountRef.current += 1;
+    const count = stepCountRef.current;
+
     setPosition(next);
-    setSteps(s => {
-      const nextStepCount = s + 1;
-      console.log(`[iOS PDR LOG] Step #${nextStepCount} | Auto Step Length: ${len.toFixed(2)}m | Heading: ${headingRef.current.toFixed(1)}° | Pos: X=${next.x}m, Y=${next.y}m`);
-      return nextStepCount;
-    });
+    setSteps(count);
+    setCurrentStepLength(len);
     setPath(p => [...p, next]);
-  };
 
-  const computeWeinbergStepLength = () => {
-    const buf = stepAccelBufferRef.current;
-    if (buf.length < 3) return 0.70;
-    const maxAccel = Math.max(...buf);
-    const minAccel = Math.min(...buf);
-    stepAccelBufferRef.current = [];
-    
-    const bounceDiff = Math.max(0.1, maxAccel - minAccel);
-    const estimatedLen = WEINBERG_K * Math.pow(bounceDiff, 0.25);
-    return Number(Math.min(1.1, Math.max(0.45, estimatedLen)).toFixed(2));
-  };
+    console.log(`[iOS PDR] Step #${count} | Length: ${len.toFixed(2)}m | Heading: ${thetaDeg.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
+  }, [autoStepLenEnabled, fixedStepLength]);
 
+  // Weinberg step length estimator based on vertical acceleration bounce
+  const computeWeinbergLength = useCallback((maxA, minA) => {
+    const bounceDiff = Math.max(0.12, maxA - minA);
+    const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
+    return Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // Throttled UI State Sync Loop (100ms) - Keeps React rendering smooth at 10Hz
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    const uiSyncTimer = setInterval(() => {
+      setHeading(smoothedHeadingRef.current);
+      setMagneticField(magFieldRef.current);
+      setLiveDynAccel(Number(filteredDynAccelRef.current.toFixed(3)));
+    }, 100);
+    return () => clearInterval(uiSyncTimer);
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // Hardware Sensor Subscriptions (Lifecycle Independent of State Changes)
+  // --------------------------------------------------------------------------
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
+    let isMounted = true;
+
     (async () => {
       try {
-        const pAvail = await Pedometer.isAvailableAsync();
-        const mAvail = await DeviceMotion.isAvailableAsync();
-        const magAvail = await Magnetometer.isAvailableAsync();
-        
-        setAvailable(`Pedometer: ${pAvail ? "yes" : "no"} | Motion: ${mAvail ? "yes" : "no"} | Mag: ${magAvail ? "yes" : "no"}`);
-        
-        if (pAvail) await Pedometer.requestPermissionsAsync();
-        if (mAvail) await DeviceMotion.requestPermissionsAsync();
-        if (magAvail) await Magnetometer.requestPermissionsAsync();
+        const [pAvail, mAvail, magAvail] = await Promise.all([
+          Pedometer.isAvailableAsync().catch(() => false),
+          DeviceMotion.isAvailableAsync().catch(() => false),
+          Magnetometer.isAvailableAsync().catch(() => false)
+        ]);
 
+        if (!isMounted) return;
+
+        setAvailable(`Motion: ${mAvail ? "✓" : "✗"} | Mag: ${magAvail ? "✓" : "✗"} | Pedometer: ${pAvail ? "✓" : "✗"}`);
+
+        if (mAvail) await DeviceMotion.requestPermissionsAsync().catch(() => {});
+        if (magAvail) await Magnetometer.requestPermissionsAsync().catch(() => {});
+        if (pAvail) await Pedometer.requestPermissionsAsync().catch(() => {});
+
+        // 1. Magnetometer Listener (100ms)
         Magnetometer.setUpdateInterval(100);
         magSub = Magnetometer.addListener(data => {
+          if (!data) return;
           const { x, y, z } = data;
           const totalField = Math.sqrt(x * x + y * y + z * z);
-          setMagneticField({
+          magFieldRef.current = {
             x: Number(x.toFixed(1)),
             y: Number(y.toFixed(1)),
             z: Number(z.toFixed(1)),
             total: Number(totalField.toFixed(1))
-          });
+          };
+
+          if (rawHeadingRef.current === null || rawHeadingRef.current === undefined) {
+            const magHeading = norm(Math.atan2(-x, y) * (180 / Math.PI));
+            rawHeadingRef.current = magHeading;
+          }
         });
 
+        // 2. DeviceMotion / Orientation Listener (40ms = 25Hz)
         DeviceMotion.setUpdateInterval(40);
         motionSub = DeviceMotion.addListener(data => {
-          if (!data?.rotation) return;
-          const raw = norm(alphaDeg(data.rotation.alpha));
-          setRawHeading(raw);
-          if (headingZero !== null) {
-            const rel = signed(raw - headingZero);
-            let diff = rel - smoothedHeadingRef.current;
-            if (diff > 180) diff -= 360;
-            if (diff < -180) diff += 360;
-            
-            smoothedHeadingRef.current = norm(smoothedHeadingRef.current + LPF_ALPHA * diff);
-            const formattedHeading = signed(smoothedHeadingRef.current);
-            headingRef.current = formattedHeading;
-            setHeading(formattedHeading);
-          }
-        });
+          if (!data) return;
 
-        pedSub = Pedometer.watchStepCount(result => {
-          const current = result.steps || 0;
-          if (!initializedPedRef.current) {
-            prevPedRef.current = current;
-            initializedPedRef.current = true;
+          let rawDeg = 0;
+          if (data.rotation && typeof data.rotation.alpha === "number") {
+            const alpha = data.rotation.alpha;
+            rawDeg = Math.abs(alpha) <= Math.PI * 2.2 ? radToDeg(alpha) : alpha;
+            rawDeg = norm(rawDeg);
+          } else {
             return;
           }
-          const prev = prevPedRef.current;
-          if (runningRef.current && current > prev) {
-            const autoLen = computeWeinbergStepLength();
-            for (let i = 0; i < current - prev; i++) addStep(autoLen);
+
+          rawHeadingRef.current = rawDeg;
+
+          if (headingZeroRef.current !== null) {
+            // iOS CoreMotion alpha rotation convention: turning right increases relative heading (+90)
+            const deltaRaw = norm(rawDeg - headingZeroRef.current);
+            const targetHeading = deltaRaw > 180 ? deltaRaw - 360 : deltaRaw;
+
+            // Continuous circular low-pass filter
+            let diff = targetHeading - smoothedHeadingRef.current;
+            while (diff > 180) diff -= 360;
+            while (diff < -180) diff += 360;
+
+            smoothedHeadingRef.current = Number((smoothedHeadingRef.current + LPF_HEADING * diff).toFixed(2));
+            if (smoothedHeadingRef.current > 180) smoothedHeadingRef.current -= 360;
+            if (smoothedHeadingRef.current < -180) smoothedHeadingRef.current += 360;
           }
-          prevPedRef.current = current;
         });
 
-        Accelerometer.setUpdateInterval(40);
+        // 3. Real-Time High-Precision Accelerometer Peak-Valley Step Detector (20ms = 50Hz)
+        Accelerometer.setUpdateInterval(20);
         accelSub = Accelerometer.addListener(data => {
-          if (!runningRef.current) return;
+          if (!data) return;
           const { x, y, z } = data;
-          const mag = Math.sqrt(x * x + y * y + z * z);
-          stepAccelBufferRef.current.push(mag);
+          const rawMag = Math.sqrt(x * x + y * y + z * z); // in g
+
+          // Update dynamic gravity baseline
+          gravityRef.current = 0.95 * gravityRef.current + 0.05 * rawMag;
+          const dynAccel = rawMag - gravityRef.current;
+
+          // Filter dynamic acceleration
+          filteredDynAccelRef.current += 0.35 * (dynAccel - filteredDynAccelRef.current);
+          const filtered = filteredDynAccelRef.current;
+
+          if (!runningRef.current) return;
 
           const now = Date.now();
-          if (mag > ACCEL_THRESHOLD && (now - lastStepTimeRef.current) > ACCEL_MIN_DELAY) {
-            if (!pAvail || !initializedPedRef.current) {
-              lastStepTimeRef.current = now;
-              const autoLen = computeWeinbergStepLength();
-              addStep(autoLen);
+          const cfg = sensitivityRef.current;
+
+          // Finite State Machine for Step Detection
+          if (stepStateRef.current === "IDLE") {
+            if (filtered > cfg.peak && (now - lastStepTimeRef.current) > cfg.minDelay) {
+              stepStateRef.current = "PEAK_DETECTED";
+              stepPeakMaxRef.current = rawMag;
+              stepValleyMinRef.current = rawMag;
+            }
+          } else if (stepStateRef.current === "PEAK_DETECTED") {
+            if (rawMag > stepPeakMaxRef.current) {
+              stepPeakMaxRef.current = rawMag;
+            }
+            if (filtered < cfg.valley) {
+              stepStateRef.current = "VALLEY_DETECTED";
+              stepValleyMinRef.current = rawMag;
+            }
+          } else if (stepStateRef.current === "VALLEY_DETECTED") {
+            if (rawMag < stepValleyMinRef.current) {
+              stepValleyMinRef.current = rawMag;
+            }
+            if (filtered > -0.02) {
+              const dt = now - lastStepTimeRef.current;
+              if (dt >= cfg.minDelay && dt <= 1400) {
+                lastStepTimeRef.current = now;
+                const autoLen = computeWeinbergLength(stepPeakMaxRef.current, stepValleyMinRef.current);
+                recordStep(autoLen);
+              }
+              stepStateRef.current = "IDLE";
             }
           }
         });
+
       } catch (e) {
-        setStatus("iOS Sensor error: " + (e?.message || String(e)));
+        if (isMounted) {
+          setStatus("iOS Sensor error: " + (e?.message || String(e)));
+        }
       }
     })();
-    return () => { motionSub?.remove?.(); pedSub?.remove?.(); accelSub?.remove?.(); magSub?.remove?.(); };
-  }, [headingZero]);
+
+    return () => {
+      isMounted = false;
+      motionSub?.remove?.();
+      pedSub?.remove?.();
+      accelSub?.remove?.();
+      magSub?.remove?.();
+    };
+  }, [recordStep, computeWeinbergLength]);
+
+  // --------------------------------------------------------------------------
+  // User Actions & Controls
+  // --------------------------------------------------------------------------
+  const setZero = () => {
+    headingZeroRef.current = rawHeadingRef.current;
+    smoothedHeadingRef.current = 0;
+    setHeading(0);
+    setStatus("iOS Heading zero calibrated (Forward = 0°)");
+  };
+
+  const start = () => {
+    if (headingZeroRef.current === null) {
+      headingZeroRef.current = rawHeadingRef.current;
+      smoothedHeadingRef.current = 0;
+      setHeading(0);
+    }
+    runningRef.current = true;
+    setRunning(true);
+    setStatus("Recording iOS PDR path...");
+  };
+
+  const stop = () => {
+    runningRef.current = false;
+    setRunning(false);
+    setStatus("Tracking paused");
+  };
+
+  const reset = () => {
+    runningRef.current = false;
+    setRunning(false);
+    stepCountRef.current = 0;
+    setSteps(0);
+    positionRef.current = { x: 0, y: 0 };
+    setPosition({ x: 0, y: 0 });
+    setPath([{ x: 0, y: 0 }]);
+    stepStateRef.current = "IDLE";
+    setStatus("Reset to origin (0,0)");
+  };
 
   const closeLoop = () => {
     if (path.length <= 2) {
-      Alert.alert("Loop Closure Error", "Walk a complete loop first before applying loop closure.");
+      Alert.alert("Loop Closure Error", "Walk a closed loop path before applying loop closure.");
       return;
     }
     const lastPt = path[path.length - 1];
@@ -191,7 +347,7 @@ export default function AppIOS() {
     setPosition(finalPos);
     setPath(correctedPath);
     setStatus("Loop Closure Applied! Drift eliminated.");
-    Alert.alert("iOS Loop Closure Complete", `Accumulated drift of X:${lastPt.x.toFixed(2)}m, Y:${lastPt.y.toFixed(2)}m corrected back to (0,0).`);
+    Alert.alert("iOS Loop Closure", `Corrected drift of X: ${lastPt.x.toFixed(2)}m, Y: ${lastPt.y.toFixed(2)}m back to origin.`);
   };
 
   const handleSavePath = async () => {
@@ -210,7 +366,7 @@ export default function AppIOS() {
       setStatus(`Path saved! (${steps} steps, ${totalDist.toFixed(2)}m)`);
       Alert.alert("Path Saved", `Successfully saved route with ${steps} steps and ${path.length} waypoints.`);
     } catch (e) {
-      Alert.alert("Save Error", "Failed to save path to local storage.");
+      Alert.alert("Save Error", "Failed to save path to storage.");
     }
   };
 
@@ -233,9 +389,7 @@ export default function AppIOS() {
         onPress: async () => {
           const updated = await deleteSavedPath(id);
           setSavedPaths(updated);
-          if (selectedPreviousPath?.id === id) {
-            setSelectedPreviousPath(null);
-          }
+          if (selectedPreviousPath?.id === id) setSelectedPreviousPath(null);
           setStatus("Saved path deleted.");
         }
       }
@@ -258,18 +412,13 @@ export default function AppIOS() {
     ]);
   };
 
-  const setZero = () => { setHeadingZero(rawHeading); headingRef.current = 0; setHeading(0); setStatus("iOS Heading zero calibrated"); };
-  const start = () => { if (headingZero === null) { Alert.alert("Set heading first", "Face forward and tap Set Heading Zero."); return; } runningRef.current = true; setRunning(true); setStatus("Recording iOS PDR path"); };
-  const stop = () => { runningRef.current = false; setRunning(false); setStatus("Stopped"); };
-  const reset = () => { runningRef.current = false; setRunning(false); setSteps(0); setPosition({x:0,y:0}); positionRef.current={x:0,y:0}; setPath([{x:0,y:0}]); setStatus("Reset to (0,0)"); };
-
   const dist = steps * currentStepLength;
 
   return (
     <SafeAreaView style={s.safe}>
       <ScrollView contentContainerStyle={s.container}>
         <Text style={s.title}>Indoor PDR Navigation</Text>
-        <Text style={s.sub}>Apple CoreMotion Sensors • BLE Proximity • Start (0,0)</Text>
+        <Text style={s.sub}>Real-Time FSM Peak-Valley Detector • Smooth Dead Reckoning</Text>
 
         {/* Section Switcher Tabs */}
         <View style={s.tabContainer}>
@@ -296,46 +445,93 @@ export default function AppIOS() {
         ) : (
           <>
             <View style={s.card}>
-              <Text style={s.label}>Sensors</Text>
-              <Text>{available}</Text>
+              <Text style={s.label}>Hardware Sensors Status</Text>
+              <Text style={s.sensorAvailText}>{available}</Text>
               <Text style={s.status}>{status}</Text>
             </View>
-            <View style={s.row}><Metric label="Steps" value={String(steps)}/><Metric label="Heading" value={`${heading.toFixed(1)}°`}/></View>
-            <View style={s.row}><Metric label="X" value={`${position.x.toFixed(2)} m`}/><Metric label="Y" value={`${position.y.toFixed(2)} m`}/></View>
-            <View style={s.row}><Metric label="Distance" value={`${dist.toFixed(2)} m`}/><Metric label="Auto Step Length" value={`${currentStepLength.toFixed(2)} m`}/></View>
-            
-            <View style={s.card}>
-              <Text style={s.label}>Magnetic Field Intensity (Magnetometer)</Text>
-              <View style={s.row}>
-                <Metric label="Total B-Field" value={`${magneticField.total} μT`}/>
-              </View>
-              <View style={{marginTop: 8}}>
-                <Metric label="B-Vector (X, Y, Z μT)" value={`X: ${magneticField.x} | Y: ${magneticField.y} | Z: ${magneticField.z}`} fullWidth/>
-              </View>
-            </View>
-
-            <View style={s.card}>
-              <Text style={s.label}>Live Waypoint List (Coordinates)</Text>
-              <ScrollView style={{maxHeight: 140}}>
-                {path.map((pt, idx) => (
-                  <Text key={idx} style={{fontFamily: "monospace", fontSize: 13, color: idx === path.length - 1 ? "#1f6feb" : "#24292f"}}>
-                    Step {idx}: X={pt.x.toFixed(2)}m, Y={pt.y.toFixed(2)}m
-                  </Text>
-                ))}
-              </ScrollView>
-            </View>
-
-            <PathPlot points={path} previousPath={selectedPreviousPath} />
 
             <View style={s.row}>
-              <Btn text="Set Heading Zero" onPress={setZero}/>
-              <Btn text={running?"Stop":"Start"} onPress={running?stop:start} strong/>
+              <Metric label="Steps" value={String(steps)} highlight />
+              <Metric label="Heading" value={`${heading >= 0 ? "+" : ""}${heading.toFixed(1)}°`} highlight />
+            </View>
+
+            <View style={s.row}>
+              <Metric label="X Position" value={`${position.x.toFixed(2)} m`} />
+              <Metric label="Y Position" value={`${position.y.toFixed(2)} m`} />
+            </View>
+
+            <View style={s.row}>
+              <Metric label="Total Distance" value={`${dist.toFixed(2)} m`} />
+              <Metric label="Step Length" value={`${currentStepLength.toFixed(2)} m`} />
+            </View>
+
+            {/* Sensitivity & Step Length Settings */}
+            <View style={s.card}>
+              <Text style={s.label}>Step Detection Sensitivity</Text>
+              <View style={s.sensitivityRow}>
+                {["high", "medium", "low"].map((mode) => (
+                  <Pressable
+                    key={mode}
+                    onPress={() => setStepSensitivity(mode)}
+                    style={[s.sensBtn, stepSensitivity === mode && s.sensBtnActive]}
+                  >
+                    <Text style={[s.sensBtnText, stepSensitivity === mode && s.sensBtnTextActive]}>
+                      {SENSITIVITY_PRESETS[mode].label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                <Text style={{ fontSize: 12, color: "#57606a" }}>
+                  Live Accel Dyn: <Text style={{ fontFamily: "monospace", fontWeight: "700", color: "#1f6feb" }}>{liveDynAccel > 0 ? `+${liveDynAccel}` : liveDynAccel}g</Text>
+                </Text>
+                <Pressable
+                  onPress={() => setAutoStepLenEnabled(!autoStepLenEnabled)}
+                  style={[s.toggleBtn, autoStepLenEnabled ? s.toggleBtnOn : s.toggleBtnOff]}
+                >
+                  <Text style={[s.toggleBtnText, autoStepLenEnabled && { color: "white" }]}>
+                    {autoStepLenEnabled ? "Auto Weinberg SL: ON" : "Fixed SL: 0.70m"}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {/* 2D Path Map with Live Orientation Arrow */}
+            <PathPlot points={path} heading={heading} previousPath={selectedPreviousPath} />
+
+            {/* Main Action Buttons */}
+            <View style={s.row}>
+              <Btn text="Set Heading Zero" onPress={setZero} />
+              <Btn text={running ? "Stop" : "Start Tracking"} onPress={running ? stop : start} strong />
             </View>
 
             <View style={s.row}>
               <Btn text="Save Path" onPress={handleSavePath} bg="#1a7f37" color="white" />
               <Btn text="Close Loop" onPress={closeLoop} />
-              <Btn text="Reset Path" onPress={reset}/>
+              <Btn text="Reset Path" onPress={reset} />
+            </View>
+
+            {/* Magnetic Field Diagnostics */}
+            <View style={s.card}>
+              <Text style={s.label}>Magnetometer Flux (μT)</Text>
+              <View style={s.row}>
+                <Metric label="Total B-Field" value={`${magneticField.total} μT`} />
+              </View>
+              <View style={{ marginTop: 6 }}>
+                <Metric label="Vector (X, Y, Z)" value={`X: ${magneticField.x} | Y: ${magneticField.y} | Z: ${magneticField.z}`} fullWidth />
+              </View>
+            </View>
+
+            {/* Live Waypoints List */}
+            <View style={s.card}>
+              <Text style={s.label}>Live Waypoints History ({path.length} pts)</Text>
+              <ScrollView style={{ maxHeight: 120 }}>
+                {path.map((pt, idx) => (
+                  <Text key={idx} style={{ fontFamily: "monospace", fontSize: 12, color: idx === path.length - 1 ? "#1f6feb" : "#57606a", paddingVertical: 1 }}>
+                    #{idx}: X={pt.x.toFixed(2)}m, Y={pt.y.toFixed(2)}m {idx === 0 ? "(START)" : idx === path.length - 1 ? "(NOW)" : ""}
+                  </Text>
+                ))}
+              </ScrollView>
             </View>
 
             {/* Saved Paths History Card */}
@@ -353,7 +549,7 @@ export default function AppIOS() {
                   No saved paths yet. Walk a route and tap "Save Path" to store it here.
                 </Text>
               ) : (
-                <ScrollView style={{ maxHeight: 220 }}>
+                <ScrollView style={{ maxHeight: 200 }}>
                   {savedPaths.map((item) => {
                     const isSelected = selectedPreviousPath?.id === item.id;
                     return (
@@ -387,52 +583,70 @@ export default function AppIOS() {
             </View>
 
             <View style={s.card}>
-              <Text style={s.label}>iOS Motion Guide</Text>
-              <Text style={s.help}>Hold iPhone flat, screen pointing up. CoreMotion CMPedometer will trigger hardware steps and DeviceMotion will track compass orientation.</Text>
+              <Text style={s.label}>iOS Guide</Text>
+              <Text style={s.help}>
+                • Hold phone flat, top of phone pointed forward in the direction you are walking.{"\n"}
+                • Tap "Set Heading Zero" while facing forward, then tap "Start Tracking".{"\n"}
+                • Accelerometer FSM will register each step dynamically without pedometer lag.
+              </Text>
             </View>
           </>
         )}
+
+        {/* Global App-Level OTA Updates */}
+        <OtaUpdateCard />
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-function Metric({label,value,fullWidth}){
-  return <View style={[s.metric, fullWidth && {flex: undefined, width: "100%"}]}>
-    <Text style={s.metricLabel}>{label}</Text>
-    <Text style={s.metricValue}>{value}</Text>
-  </View>
+function Metric({ label, value, fullWidth, highlight }) {
+  return (
+    <View style={[s.metric, fullWidth && { flex: undefined, width: "100%" }, highlight && s.metricHighlight]}>
+      <Text style={s.metricLabel}>{label}</Text>
+      <Text style={[s.metricValue, highlight && { color: "#0969da" }]}>{value}</Text>
+    </View>
+  );
 }
 
-function Btn({text, onPress, strong, bg, color}){
+function Btn({ text, onPress, strong, bg, color }) {
   return (
     <Pressable onPress={onPress} style={[s.btn, strong && s.btnStrong, bg ? { backgroundColor: bg, borderColor: bg } : null]}>
-      <Text style={[s.btnText, strong && {color:"white"}, color ? { color } : null]}>{text}</Text>
+      <Text style={[s.btnText, strong && { color: "white" }, color ? { color } : null]}>{text}</Text>
     </Pressable>
   );
 }
 
-function PathPlot({ points, previousPath }){
-  const width = Math.min(Dimensions.get("window").width - 32, 520), height = 340, pad = 40;
-  
+function PathPlot({ points, heading, previousPath }) {
+  const width = Math.min(Dimensions.get("window").width - 32, 520);
+  const height = 340;
+  const pad = 44;
+
   let allPts = [...points];
   if (previousPath && previousPath.points && previousPath.points.length > 0) {
     allPts = [...allPts, ...previousPath.points];
   }
 
-  let minX = 0, maxX = 0, minY = 0, maxY = 0; 
+  let minX = 0, maxX = 0, minY = 0, maxY = 0;
   allPts.forEach(p => {
     minX = Math.min(minX, p.x);
     maxX = Math.max(maxX, p.x);
     minY = Math.min(minY, p.y);
     maxY = Math.max(maxY, p.y);
   });
-  
-  const spanX = Math.max(4, maxX - minX), spanY = Math.max(4, maxY - minY);
+
+  const spanX = Math.max(4, maxX - minX);
+  const spanY = Math.max(4, maxY - minY);
   const scale = Math.min((width - pad * 2) / spanX, (height - pad * 2) / spanY);
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  const map = p => ({ x: width / 2 + (p.x - cx) * scale, y: height / 2 - (p.y - cy) * scale });
-  
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+
+  // Map real world Cartesian (m) to SVG Canvas (pixels)
+  const map = p => ({
+    x: width / 2 + (p.x - cx) * scale,
+    y: height / 2 - (p.y - cy) * scale
+  });
+
   const m = points.map(map);
   const poly = m.map(p => `${p.x},${p.y}`).join(" ");
   const start = map({ x: 0, y: 0 });
@@ -444,55 +658,84 @@ function PathPlot({ points, previousPath }){
     prevPoly = prevM.map(p => `${p.x},${p.y}`).join(" ");
     prevEnd = prevM[prevM.length - 1];
   }
-  
+
+  // Calculate live heading arrow points at user's current position (end)
+  const headingRad = (heading * Math.PI) / 180;
+  const arrowLength = 20;
+  const arrowWingDist = 11;
+  const arrowAngleSpread = 2.4; // radians (~137 degrees)
+
+  const tip = {
+    x: end.x + arrowLength * Math.sin(headingRad),
+    y: end.y - arrowLength * Math.cos(headingRad)
+  };
+  const leftWing = {
+    x: end.x + arrowWingDist * Math.sin(headingRad - arrowAngleSpread),
+    y: end.y - arrowWingDist * Math.cos(headingRad - arrowAngleSpread)
+  };
+  const rightWing = {
+    x: end.x + arrowWingDist * Math.sin(headingRad + arrowAngleSpread),
+    y: end.y - arrowWingDist * Math.cos(headingRad + arrowAngleSpread)
+  };
+  const arrowPolygon = `${tip.x},${tip.y} ${leftWing.x},${leftWing.y} ${end.x},${end.y} ${rightWing.x},${rightWing.y}`;
+
   return (
     <View style={s.plot}>
       <Text style={s.label}>Live PDR Walk Route Map (iOS)</Text>
-      
+
       {/* Map Legend */}
       <View style={s.legendRow}>
         <View style={s.legendItem}>
           <View style={[s.legendColor, { backgroundColor: "#1f6feb" }]} />
-          <Text style={s.legendText}>Current Path</Text>
+          <Text style={s.legendText}>Current Route</Text>
+        </View>
+        <View style={s.legendItem}>
+          <View style={[s.legendColor, { backgroundColor: "#cf222e" }]} />
+          <Text style={s.legendText}>Live Pointer ({heading.toFixed(0)}°)</Text>
         </View>
         {previousPath && (
           <View style={s.legendItem}>
             <View style={[s.legendColor, { backgroundColor: "#d97706" }]} />
-            <Text style={s.legendText}>Previous ({previousPath.name})</Text>
+            <Text style={s.legendText}>Previous Path</Text>
           </View>
         )}
       </View>
 
       <Svg width={width} height={height}>
-        <Line x1="0" y1={start.y} x2={width} y2={start.y} stroke="#e1e4e8" strokeDasharray="4,4"/>
-        <Line x1={start.x} y1="0" x2={start.x} y2={height} stroke="#e1e4e8" strokeDasharray="4,4"/>
-        
-        {/* Render Previous Path Overlay */}
+        {/* Origin Axes Grid Lines */}
+        <Line x1="0" y1={start.y} x2={width} y2={start.y} stroke="#e1e4e8" strokeDasharray="4,4" />
+        <Line x1={start.x} y1="0" x2={start.x} y2={height} stroke="#e1e4e8" strokeDasharray="4,4" />
+
+        {/* Previous Saved Path Overlay */}
         {previousPath && prevPoly.length > 0 && (
           <>
-            <Polyline points={prevPoly} fill="none" stroke="#d97706" strokeWidth="3.5" strokeDasharray="6,4" strokeLinejoin="round" strokeLinecap="round" opacity={0.85} />
+            <Polyline points={prevPoly} fill="none" stroke="#d97706" strokeWidth="3" strokeDasharray="6,4" strokeLinejoin="round" strokeLinecap="round" opacity={0.85} />
             {prevM.map((pt, i) => (
-              <Circle key={`prev-${i}`} cx={pt.x} cy={pt.y} r={i === prevM.length - 1 ? 5 : 3} fill="#d97706" opacity={0.85} />
+              <Circle key={`prev-${i}`} cx={pt.x} cy={pt.y} r={i === prevM.length - 1 ? 4.5 : 2.5} fill="#d97706" opacity={0.85} />
             ))}
             {prevEnd && (
-              <SvgText x={prevEnd.x + 8} y={prevEnd.y - 8} fontSize="11" fontWeight="bold" fill="#b45309">
+              <SvgText x={prevEnd.x + 8} y={prevEnd.y - 8} fontSize="10" fontWeight="bold" fill="#b45309">
                 PREV ({previousPath.points[previousPath.points.length - 1].x.toFixed(1)}, {previousPath.points[previousPath.points.length - 1].y.toFixed(1)})
               </SvgText>
             )}
           </>
         )}
 
-        {/* Render Current Live Path */}
-        <Polyline points={poly} fill="none" stroke="#1f6feb" strokeWidth="4" strokeLinejoin="round" strokeLinecap="round"/>
+        {/* Live Active Path */}
+        <Polyline points={poly} fill="none" stroke="#1f6feb" strokeWidth="3.5" strokeLinejoin="round" strokeLinecap="round" />
         {m.map((pt, i) => (
           <Circle key={`curr-${i}`} cx={pt.x} cy={pt.y} r={i === m.length - 1 ? 5 : 3} fill={i === m.length - 1 ? "#1f6feb" : "#0969da"} />
         ))}
 
-        <Circle cx={start.x} cy={start.y} r="7" fill="#1a7f37"/>
-        <SvgText x={start.x+10} y={start.y-8} fontSize="12" fontWeight="bold" fill="#1a7f37">START (0,0)</SvgText>
-        <Circle cx={end.x} cy={end.y} r="8" fill="#cf222e"/>
-        <SvgText x={end.x+10} y={end.y+16} fontSize="12" fontWeight="bold" fill="#cf222e">
-          NOW ({points[points.length-1].x.toFixed(1)}, {points[points.length-1].y.toFixed(1)})
+        {/* Start Position Marker */}
+        <Circle cx={start.x} cy={start.y} r="6" fill="#1a7f37" />
+        <SvgText x={start.x + 8} y={start.y - 6} fontSize="11" fontWeight="bold" fill="#1a7f37">START (0,0)</SvgText>
+
+        {/* Live Facing Direction Pointer & Current Marker */}
+        <Polygon points={arrowPolygon} fill="#cf222e" stroke="#ffffff" strokeWidth="1" />
+        <Circle cx={end.x} cy={end.y} r="5" fill="#cf222e" />
+        <SvgText x={end.x + 8} y={end.y + 14} fontSize="11" fontWeight="bold" fill="#cf222e">
+          NOW ({points[points.length - 1].x.toFixed(1)}, {points[points.length - 1].y.toFixed(1)})
         </SvgText>
       </Svg>
     </View>
@@ -502,21 +745,33 @@ function PathPlot({ points, previousPath }){
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "#f6f8fa" },
   container: { padding: 16, paddingBottom: 40 },
-  title: { fontSize: 30, fontWeight: "800" },
-  sub: { color: "#57606a", marginBottom: 14 },
+  title: { fontSize: 26, fontWeight: "800", color: "#24292f" },
+  sub: { color: "#57606a", marginBottom: 12, fontSize: 13 },
   card: { backgroundColor: "white", borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: "#d0d7de" },
   plot: { backgroundColor: "white", borderRadius: 14, paddingTop: 14, marginBottom: 12, borderWidth: 1, borderColor: "#d0d7de", alignItems: "center" },
-  label: { fontWeight: "700", color: "#57606a", marginBottom: 6 },
-  status: { marginTop: 5, color: "#57606a" },
+  label: { fontWeight: "700", color: "#57606a", marginBottom: 6, fontSize: 13 },
+  sensorAvailText: { fontSize: 13, color: "#24292f", fontFamily: "monospace" },
+  status: { marginTop: 4, color: "#0969da", fontWeight: "600", fontSize: 13 },
   row: { flexDirection: "row", gap: 10, marginBottom: 10 },
-  metric: { flex: 1, backgroundColor: "white", borderRadius: 14, padding: 14, borderWidth: 1, borderColor: "#d0d7de" },
-  metricLabel: { fontSize: 12, color: "#57606a" },
-  metricValue: { fontSize: 22, fontWeight: "800" },
-  input: { borderWidth: 1, borderColor: "#8c959f", borderRadius: 10, padding: 10, fontSize: 18 },
-  help: { color: "#57606a", lineHeight: 20 },
-  btn: { flex: 1, borderRadius: 12, paddingVertical: 13, alignItems: "center", borderWidth: 1, borderColor: "#8c959f", backgroundColor: "white" },
+  metric: { flex: 1, backgroundColor: "white", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#d0d7de" },
+  metricHighlight: { borderColor: "#54aeff", backgroundColor: "#f0f8ff" },
+  metricLabel: { fontSize: 11, color: "#57606a", fontWeight: "600" },
+  metricValue: { fontSize: 20, fontWeight: "800", color: "#24292f", marginTop: 2 },
+  help: { color: "#57606a", lineHeight: 19, fontSize: 12 },
+  btn: { flex: 1, borderRadius: 10, paddingVertical: 12, alignItems: "center", borderWidth: 1, borderColor: "#8c959f", backgroundColor: "white" },
   btnStrong: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
-  btnText: { fontWeight: "700" },
+  btnText: { fontWeight: "700", fontSize: 13 },
+
+  // Sensitivity controls
+  sensitivityRow: { flexDirection: "row", gap: 8, marginTop: 4 },
+  sensBtn: { flex: 1, paddingVertical: 8, borderRadius: 8, borderWidth: 1, borderColor: "#d0d7de", alignItems: "center", backgroundColor: "#f6f8fa" },
+  sensBtnActive: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
+  sensBtnText: { fontSize: 12, fontWeight: "700", color: "#57606a" },
+  sensBtnTextActive: { color: "#ffffff" },
+  toggleBtn: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
+  toggleBtnOn: { backgroundColor: "#0969da", borderColor: "#0969da" },
+  toggleBtnOff: { backgroundColor: "#ffffff", borderColor: "#8c959f" },
+  toggleBtnText: { fontSize: 11, fontWeight: "700", color: "#57606a" },
 
   // Tab switcher styles
   tabContainer: {
@@ -525,13 +780,13 @@ const s = StyleSheet.create({
     borderRadius: 12,
     padding: 4,
     marginBottom: 14,
-    gap: 4,
+    gap: 4
   },
   tabBtn: {
     flex: 1,
     paddingVertical: 10,
     alignItems: "center",
-    borderRadius: 8,
+    borderRadius: 8
   },
   tabBtnActive: {
     backgroundColor: "#ffffff",
@@ -539,34 +794,34 @@ const s = StyleSheet.create({
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.1,
     shadowRadius: 2,
-    elevation: 2,
+    elevation: 2
   },
   tabBtnText: {
     fontSize: 13,
     fontWeight: "700",
-    color: "#57606a",
+    color: "#57606a"
   },
   tabBtnTextActive: {
-    color: "#1f6feb",
+    color: "#1f6feb"
   },
 
   // Legend styles
-  legendRow: { flexDirection: "row", gap: 16, marginBottom: 8, marginTop: 2 },
-  legendItem: { flexDirection: "row", alignItems: "center", gap: 6 },
-  legendColor: { width: 14, height: 4, borderRadius: 2 },
-  legendText: { fontSize: 12, color: "#57606a", fontWeight: "600" },
+  legendRow: { flexDirection: "row", gap: 12, marginBottom: 8, marginTop: 2 },
+  legendItem: { flexDirection: "row", alignItems: "center", gap: 5 },
+  legendColor: { width: 12, height: 4, borderRadius: 2 },
+  legendText: { fontSize: 11, color: "#57606a", fontWeight: "600" },
 
   // Saved Paths list styles
   clearBtn: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, backgroundColor: "#fff0f0", borderWidth: 1, borderColor: "#ffc9c9" },
-  clearBtnText: { fontSize: 12, color: "#cf222e", fontWeight: "700" },
-  savedItem: { flexDirection: "row", alignItems: "center", paddingVertical: 10, paddingHorizontal: 10, borderRadius: 10, borderWidth: 1, borderColor: "#e1e4e8", marginBottom: 8, backgroundColor: "#fafafa" },
+  clearBtnText: { fontSize: 11, color: "#cf222e", fontWeight: "700" },
+  savedItem: { flexDirection: "row", alignItems: "center", paddingVertical: 8, paddingHorizontal: 10, borderRadius: 10, borderWidth: 1, borderColor: "#e1e4e8", marginBottom: 8, backgroundColor: "#fafafa" },
   savedItemSelected: { borderColor: "#d97706", backgroundColor: "#fffbeb" },
-  savedTitle: { fontWeight: "700", fontSize: 14, color: "#24292f" },
-  savedMeta: { fontSize: 12, color: "#57606a", marginTop: 2 },
+  savedTitle: { fontWeight: "700", fontSize: 13, color: "#24292f" },
+  savedMeta: { fontSize: 11, color: "#57606a", marginTop: 1 },
   savedMetaSub: { fontSize: 11, color: "#0969da", fontWeight: "600", marginTop: 1 },
-  actionBtn: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1, alignItems: "center" },
+  actionBtn: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 6, borderWidth: 1, alignItems: "center" },
   actionBtnOutline: { borderColor: "#1f6feb", backgroundColor: "white" },
   actionBtnActive: { backgroundColor: "#d97706", borderColor: "#d97706" },
   actionBtnDanger: { borderColor: "#ffc9c9", backgroundColor: "#fff0f0" },
-  actionBtnText: { fontSize: 12, fontWeight: "700", color: "#1f6feb" }
+  actionBtnText: { fontSize: 11, fontWeight: "700", color: "#1f6feb" }
 });
