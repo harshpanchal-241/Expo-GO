@@ -31,11 +31,16 @@ const signed = d => {
 
 const alphaDeg = a => (Math.abs(a) <= Math.PI * 2.2 ? (a * 180) / Math.PI : a);
 
+// Weinberg dynamic step length estimation constant (calibrated for g units)
+const WEINBERG_K = 0.74;
+
 export default function AppAndroid() {
   const [running, setRunning] = useState(false);
   const [available, setAvailable] = useState("checking...");
   const [steps, setSteps] = useState(0);
-  const [stepLength, setStepLength] = useState(0.70);
+  const [totalDistance, setTotalDistance] = useState(0);
+  const [currentStepLength, setCurrentStepLength] = useState(0.70);
+  const [lastBounce, setLastBounce] = useState(0);
   const [heading, setHeading] = useState(0);
   const [headingZero, setHeadingZero] = useState(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
@@ -57,7 +62,8 @@ export default function AppAndroid() {
   const headingZeroRef = useRef(null);
   const smoothedHeadingRef = useRef(0);
   const positionRef = useRef({ x: 0, y: 0 });
-  const stepLengthRef = useRef(0.70);
+  const totalDistanceRef = useRef(0);
+  const stepAccelBufferRef = useRef([]);
   const lastStepTimeRef = useRef(0);
   const gravityRef = useRef(1.0);
   const hasMotionRotationRef = useRef(false);
@@ -72,9 +78,17 @@ export default function AppAndroid() {
     setSavedPaths(list);
   };
 
-  // Add a step and update position & path
-  const addStep = (customLen = null) => {
-    const len = customLen || stepLengthRef.current || 0.70;
+  // Add a step with dynamic sensor-detected length
+  const addStep = (dynamicLen = null, bounceAmp = 0) => {
+    const len = dynamicLen && isFinite(dynamicLen) && dynamicLen >= 0.45 && dynamicLen <= 1.15
+      ? dynamicLen
+      : 0.70;
+
+    setCurrentStepLength(len);
+    if (bounceAmp > 0) {
+      setLastBounce(bounceAmp);
+    }
+
     const curHeading = headingRef.current || 0;
     const rad = (curHeading * Math.PI) / 180;
     const old = positionRef.current;
@@ -89,18 +103,21 @@ export default function AppAndroid() {
       y: Number((old.y + len * Math.cos(rad)).toFixed(2))
     };
 
+    totalDistanceRef.current = Number((totalDistanceRef.current + len).toFixed(2));
+    setTotalDistance(totalDistanceRef.current);
+
     positionRef.current = next;
     setPosition(next);
     setPath(p => [...p, next]);
     setSteps(s => {
       const nextCount = s + 1;
-      console.log(`[PDR Step #${nextCount}] Heading: ${curHeading.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
+      console.log(`[Dynamic PDR Step #${nextCount}] Dynamic SL: ${len.toFixed(2)}m (Bounce: ${bounceAmp.toFixed(2)}g) | Heading: ${curHeading.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
       return nextCount;
     });
   };
 
   // --------------------------------------------------------------------------
-  // Hardware Sensors (Accelerometer Step Detection + Heading)
+  // Hardware Sensors (Dynamic Step Detection + Heading)
   // --------------------------------------------------------------------------
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
@@ -178,12 +195,18 @@ export default function AppAndroid() {
           }
         });
 
-        // 3. Simple & Robust Accelerometer Step Detector
+        // 3. Dynamic Accelerometer Step Detector with Weinberg Stride Calculation
         Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
           if (!runningRef.current) return;
           const { x, y, z } = data;
           const mag = Math.sqrt(x * x + y * y + z * z); // in g
+
+          // Buffer acceleration magnitude for dynamic bounce swing analysis
+          stepAccelBufferRef.current.push(mag);
+          if (stepAccelBufferRef.current.length > 20) {
+            stepAccelBufferRef.current.shift();
+          }
 
           // Dynamic gravity baseline
           gravityRef.current = 0.94 * gravityRef.current + 0.06 * mag;
@@ -193,14 +216,23 @@ export default function AppAndroid() {
           // Trigger step on impact peak with minimum step delay (300ms)
           if (dynamicAccel > 0.16 && (now - lastStepTimeRef.current) > 300) {
             lastStepTimeRef.current = now;
-            addStep();
+
+            // Calculate Weinberg Dynamic Step Length based on peak-to-valley bounce
+            const buf = stepAccelBufferRef.current;
+            const maxAccel = buf.length > 0 ? Math.max(...buf) : mag;
+            const minAccel = buf.length > 0 ? Math.min(...buf) : mag;
+            stepAccelBufferRef.current = [];
+
+            const bounceDiff = Math.max(0.12, maxAccel - minAccel);
+            const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
+            const dynamicStepLen = Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
+
+            addStep(dynamicStepLen, bounceDiff);
           }
         });
 
         // 4. Hardware Pedometer backup
-        pedSub = Pedometer.watchStepCount(result => {
-          // Additional step listener if available
-        });
+        pedSub = Pedometer.watchStepCount(result => {});
 
       } catch (e) {
         if (isMounted) setStatus("Sensor Error: " + (e?.message || String(e)));
@@ -238,7 +270,7 @@ export default function AppAndroid() {
     }
     runningRef.current = true;
     setRunning(true);
-    setStatus("Recording PDR path...");
+    setStatus("Recording PDR path (Dynamic Step Length active)...");
   };
 
   const stop = () => {
@@ -251,6 +283,8 @@ export default function AppAndroid() {
     runningRef.current = false;
     setRunning(false);
     setSteps(0);
+    setTotalDistance(0);
+    totalDistanceRef.current = 0;
     positionRef.current = { x: 0, y: 0 };
     setPosition({ x: 0, y: 0 });
     setPath([{ x: 0, y: 0 }]);
@@ -285,15 +319,15 @@ export default function AppAndroid() {
       Alert.alert("Cannot Save Path", "Walk a path first before saving.");
       return;
     }
-    const totalDist = steps * stepLength;
+    const dist = totalDistance;
     try {
       const updated = await savePath({
         steps,
-        distance: totalDist,
+        distance: dist,
         points: path
       });
       setSavedPaths(updated);
-      setStatus(`Path saved! (${steps} steps, ${totalDist.toFixed(2)}m)`);
+      setStatus(`Path saved! (${steps} steps, ${dist.toFixed(2)}m)`);
       Alert.alert("Path Saved", `Successfully saved route with ${steps} steps and ${path.length} waypoints.`);
     } catch (e) {
       Alert.alert("Save Error", "Failed to save path to storage.");
@@ -342,13 +376,11 @@ export default function AppAndroid() {
     ]);
   };
 
-  const dist = steps * stepLength;
-
   return (
     <SafeAreaView style={s.safe}>
       <ScrollView contentContainerStyle={s.container}>
         <Text style={s.title}>Indoor PDR Navigation</Text>
-        <Text style={s.sub}>Real-Time Step Tracking • Compass & Gyro Heading • 2D Map</Text>
+        <Text style={s.sub}>Dynamic Weinberg Step Estimation • Compass & Gyro Heading • 2D Map</Text>
 
         {/* Section Switcher Tabs */}
         <View style={s.tabContainer}>
@@ -391,44 +423,28 @@ export default function AppAndroid() {
             </View>
 
             <View style={s.row}>
-              <Metric label="Total Distance" value={`${dist.toFixed(2)} m`} />
-              <Metric label="Step Length" value={`${stepLength.toFixed(2)} m`} />
+              <Metric label="Total Distance" value={`${totalDistance.toFixed(2)} m`} />
+              <Metric label="Dynamic Step Length" value={`${currentStepLength.toFixed(2)} m`} highlight />
             </View>
 
-            {/* Step Length Adjuster & Test Step Button */}
+            {/* Dynamic Step Length Sensor Info & Test Step Button */}
             <View style={s.card}>
-              <Text style={s.label}>Step Length Configuration & Test</Text>
-              <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
-                <Pressable
-                  onPress={() => {
-                    const nextLen = Number(Math.max(0.40, stepLength - 0.05).toFixed(2));
-                    setStepLength(nextLen);
-                    stepLengthRef.current = nextLen;
-                  }}
-                  style={s.stepAdjustBtn}
-                >
-                  <Text style={s.stepAdjustText}>- 0.05m</Text>
-                </Pressable>
-                <View style={{ flex: 1, alignItems: "center" }}>
-                  <Text style={{ fontSize: 16, fontWeight: "800", color: "#1f6feb" }}>{stepLength.toFixed(2)} m</Text>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                <Text style={s.label}>Dynamic Sensor Step Estimation</Text>
+                <View style={s.autoBadge}>
+                  <Text style={s.autoBadgeText}>⚡ Auto Weinberg ($K=0.74$)</Text>
                 </View>
-                <Pressable
-                  onPress={() => {
-                    const nextLen = Number(Math.min(1.20, stepLength + 0.05).toFixed(2));
-                    setStepLength(nextLen);
-                    stepLengthRef.current = nextLen;
-                  }}
-                  style={s.stepAdjustBtn}
-                >
-                  <Text style={s.stepAdjustText}>+ 0.05m</Text>
-                </Pressable>
               </View>
+              <Text style={{ fontSize: 12, color: "#57606a", marginTop: 2 }}>
+                Step length is auto-calculated per step based on vertical foot-strike bounce amplitude.
+                {lastBounce > 0 ? ` (Last Bounce Swing: ${lastBounce.toFixed(2)}g)` : ""}
+              </Text>
               {/* Test Manual Step Button */}
               <Pressable
-                onPress={() => addStep()}
+                onPress={() => addStep(0.70, 0.50)}
                 style={s.manualStepBtn}
               >
-                <Text style={s.manualStepBtnText}>👣 Add Test Step Manually</Text>
+                <Text style={s.manualStepBtnText}>👣 Add Test Step (0.70m)</Text>
               </Pressable>
             </View>
 
@@ -523,7 +539,7 @@ export default function AppAndroid() {
               <Text style={s.help}>
                 1. Face the direction you want to walk and tap "Set Heading Zero".{"\n"}
                 2. Tap "Start Tracking" and begin walking.{"\n"}
-                3. The blue line and red orientation pointer will draw your path live on the map.
+                3. The sensors auto-estimate your step length dynamically on every step taken.
               </Text>
             </View>
           </>
@@ -697,8 +713,8 @@ const s = StyleSheet.create({
   btnStrong: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
   btnText: { fontWeight: "700", fontSize: 13 },
 
-  stepAdjustBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#f6f8fa", borderRadius: 8, borderWidth: 1, borderColor: "#d0d7de" },
-  stepAdjustText: { fontSize: 12, fontWeight: "700", color: "#1f6feb" },
+  autoBadge: { backgroundColor: "#dafbe1", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, borderWidth: 1, borderColor: "#2da44e" },
+  autoBadgeText: { fontSize: 11, fontWeight: "700", color: "#1a7f37" },
   manualStepBtn: { marginTop: 10, backgroundColor: "#eef5ff", paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: "#54aeff", alignItems: "center" },
   manualStepBtnText: { fontSize: 13, fontWeight: "700", color: "#0969da" },
 
