@@ -40,6 +40,7 @@ export default function AppIOS() {
   const [path, setPath] = useState([{ x: 0, y: 0 }]);
   const [status, setStatus] = useState("Ready (iOS)");
   const [rawHeading, setRawHeading] = useState(0);
+  const [isStationary, setIsStationary] = useState(true);
 
   const [magneticField, setMagneticField] = useState({ x: 0, y: 0, z: 0, total: 0 });
 
@@ -59,6 +60,12 @@ export default function AppIOS() {
   const lastStepTimeRef = useRef(0);
   const gravityRef = useRef(1.0);
   const hasMotionRotationRef = useRef(false);
+
+  // Stationary / Zero-Velocity Update (ZUPT) & Peak-Valley Detection Refs
+  const accelWindowRef = useRef([]);
+  const stepPhaseRef = useRef("IDLE");
+  const peakValRef = useRef(0);
+  const valleyValRef = useRef(0);
 
   // Load saved paths on mount
   useEffect(() => {
@@ -161,20 +168,62 @@ export default function AppIOS() {
           }
         });
 
-        // 3. Simple & Robust Accelerometer Step Detector
+        // 3. Accelerometer Step Detector with Zero-Velocity (ZUPT) Suppression
         Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
           if (!runningRef.current) return;
           const { x, y, z } = data;
           const mag = Math.sqrt(x * x + y * y + z * z);
 
-          gravityRef.current = 0.94 * gravityRef.current + 0.06 * mag;
-          const dynamicAccel = Math.abs(mag - gravityRef.current);
+          // Rolling window (12 samples = ~360ms) for stationary check
+          accelWindowRef.current.push(mag);
+          if (accelWindowRef.current.length > 12) {
+            accelWindowRef.current.shift();
+          }
+
+          const maxInWin = Math.max(...accelWindowRef.current);
+          const minInWin = Math.min(...accelWindowRef.current);
+          const swing = maxInWin - minInWin;
+
+          const walking = swing >= 0.26;
+          setIsStationary(!walking);
+
+          gravityRef.current = 0.92 * gravityRef.current + 0.08 * mag;
+          const dynamicAccel = mag - gravityRef.current;
 
           const now = Date.now();
-          if (dynamicAccel > 0.16 && (now - lastStepTimeRef.current) > 300) {
-            lastStepTimeRef.current = now;
-            addStep();
+
+          if (!walking) {
+            stepPhaseRef.current = "IDLE";
+          } else {
+            if (stepPhaseRef.current === "IDLE") {
+              if (dynamicAccel > 0.18 && (now - lastStepTimeRef.current) > 280) {
+                stepPhaseRef.current = "RISING";
+                peakValRef.current = dynamicAccel;
+              }
+            } else if (stepPhaseRef.current === "RISING") {
+              if (dynamicAccel > peakValRef.current) {
+                peakValRef.current = dynamicAccel;
+              }
+              if (dynamicAccel < -0.12) {
+                stepPhaseRef.current = "FALLING";
+                valleyValRef.current = dynamicAccel;
+              }
+            } else if (stepPhaseRef.current === "FALLING") {
+              if (dynamicAccel < valleyValRef.current) {
+                valleyValRef.current = dynamicAccel;
+              }
+              if (dynamicAccel > -0.04) {
+                const dt = now - lastStepTimeRef.current;
+                const totalWaveHeight = peakValRef.current - valleyValRef.current;
+
+                if (dt >= 280 && dt <= 1200 && totalWaveHeight >= 0.30) {
+                  lastStepTimeRef.current = now;
+                  addStep();
+                }
+                stepPhaseRef.current = "IDLE";
+              }
+            }
           }
         });
 
@@ -222,6 +271,7 @@ export default function AppIOS() {
   const stop = () => {
     runningRef.current = false;
     setRunning(false);
+    setIsStationary(true);
     setStatus("Tracking stopped");
   };
 
@@ -229,6 +279,7 @@ export default function AppIOS() {
     runningRef.current = false;
     setRunning(false);
     setSteps(0);
+    setIsStationary(true);
     positionRef.current = { x: 0, y: 0 };
     setPosition({ x: 0, y: 0 });
     setPath([{ x: 0, y: 0 }]);
@@ -353,8 +404,15 @@ export default function AppIOS() {
         ) : (
           <>
             <View style={s.card}>
-              <Text style={s.label}>Hardware Sensors Status</Text>
-              <Text style={{ fontSize: 13, color: "#24292f" }}>{available}</Text>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                <Text style={s.label}>Hardware Sensors Status</Text>
+                <View style={[s.motionBadge, isStationary ? s.motionBadgeStationary : s.motionBadgeWalking]}>
+                  <Text style={[s.motionBadgeText, isStationary ? s.motionTextStationary : s.motionTextWalking]}>
+                    {running ? (isStationary ? "🛑 Stationary (Still)" : "🚶 Walking") : "⏸ Idle"}
+                  </Text>
+                </View>
+              </View>
+              <Text style={{ fontSize: 13, color: "#24292f", marginTop: 4 }}>{available}</Text>
               <Text style={s.status}>{status}</Text>
             </View>
 
@@ -667,6 +725,13 @@ const s = StyleSheet.create({
   btn: { flex: 1, borderRadius: 10, paddingVertical: 12, alignItems: "center", borderWidth: 1, borderColor: "#8c959f", backgroundColor: "white" },
   btnStrong: { backgroundColor: "#1f6feb", borderColor: "#1f6feb" },
   btnText: { fontWeight: "700", fontSize: 13 },
+
+  motionBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, borderWidth: 1 },
+  motionBadgeWalking: { backgroundColor: "#dafbe1", borderColor: "#2da44e" },
+  motionBadgeStationary: { backgroundColor: "#f6f8fa", borderColor: "#d0d7de" },
+  motionBadgeText: { fontSize: 11, fontWeight: "700" },
+  motionTextWalking: { color: "#1a7f37" },
+  motionTextStationary: { color: "#57606a" },
 
   stepAdjustBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#f6f8fa", borderRadius: 8, borderWidth: 1, borderColor: "#d0d7de" },
   stepAdjustText: { fontSize: 12, fontWeight: "700", color: "#1f6feb" },
