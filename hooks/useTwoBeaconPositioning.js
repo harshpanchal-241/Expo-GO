@@ -149,12 +149,11 @@ export function useTwoBeaconPositioning({
     const mgr = managerRef.current;
 
     if (!mgr) {
-      // Expo Go simulation
+      // Expo Go simulation — start silently, don't override module state
       setIsExpoGoMode(true);
       _startSimulatedScan();
       isScanningRef.current = true;
       setIsScanning(true);
-      _setModuleState("SCANNING");
       return;
     }
 
@@ -162,7 +161,7 @@ export function useTwoBeaconPositioning({
 
     isScanningRef.current = true;
     setIsScanning(true);
-    _setModuleState("SCANNING");
+    // Note: do NOT call _setModuleState here — state is controlled by stage flow
 
     try {
       mgr.startDeviceScan(null, { allowDuplicates: true }, (error, device) => {
@@ -243,8 +242,9 @@ export function useTwoBeaconPositioning({
         setDevices(updated);
       }
 
-      // Position state (only when positioning)
-      if (modulStateRef.current === "POSITIONING") {
+      // Position state (when active or paused)
+      const ms = modulStateRef.current;
+      if (ms === "POSITIONING" || ms === "PAUSED") {
         setPositionState({ ...positionRef.current, timestamp: Date.now() });
         setTrail([...trailRef.current]);
         setDebugInfo({ ...debugRef.current });
@@ -398,15 +398,19 @@ export function useTwoBeaconPositioning({
 
     startPositioning: () => {
       if (modulStateRef.current === "POSITIONING") return;
-      // Initialise Kalman at midpoint of room
-      kalmanRef.current.reset(
-        (configRef.current.beacon1X + configRef.current.beacon2X) / 2,
-        (configRef.current.beacon1Y + configRef.current.beacon2Y) / 2,
-      );
-      pdrPosRef.current = kalmanRef.current.getPosition();
-      prevFusedRef.current = kalmanRef.current.getPosition();
-      trailRef.current = [];
+      // Initialise Kalman between the two beacons
+      const cx = (configRef.current.beacon1X + configRef.current.beacon2X) / 2;
+      const cy = (configRef.current.beacon1Y + configRef.current.beacon2Y) / 2;
+      kalmanRef.current.reset(cx, cy);
+      pdrPosRef.current    = { x: cx, y: cy };
+      prevFusedRef.current = { x: cx, y: cy };
+      trailRef.current     = [{ x: cx, y: cy }];
       lastCalcTime.current = Date.now();
+
+      // Push initial position immediately so the map dot appears right away
+      positionRef.current = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, confidence: 0 };
+      setPositionState({ ...positionRef.current, timestamp: Date.now() });
+      setTrail([{ x: cx, y: cy }]);
 
       if (!isScanningRef.current) startScan();
       _startCalcLoop();

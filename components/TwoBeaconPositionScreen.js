@@ -71,6 +71,14 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
     });
   }, []);
 
+  // ─── Auto-start scan when screen opens (continues across all stages) ────────
+  useEffect(() => {
+    if (!configLoaded) return;
+    // Start scanning silently in the background — keeps RSSI flowing on all stages
+    actions.startScan();
+  }, [configLoaded]);
+
+
   // ─── Config update helper ─────────────────────────────────────────────────
   const updateConfig = useCallback(async (updates) => {
     setConfig(prev => {
@@ -201,13 +209,13 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
           config={config}
           actions={actions}
           isScanning={isScanning}
-          onStartScan={actions.startScan}
           onSaveB1TxPower={(v) => updateConfig({ beacon1TxPower: v })}
           onSaveB2TxPower={(v) => updateConfig({ beacon2TxPower: v })}
           onSavePathLossN={(v) => updateConfig({ pathLossN: v })}
           onAdvance={() => setActiveStage("position")}
         />
       )}
+
 
       {/* ══════════════════════════════════════════════════
           STAGE 4 — POSITION TEST
@@ -317,7 +325,9 @@ function SelectBeaconsStage({
         </View>
 
         {sortedDevices.length === 0 ? (
-          <Text style={styles.emptyText}>No devices found. Tap Scan to start.</Text>
+          <Text style={styles.emptyText}>
+            {isScanning ? "🔍 Scanning for devices…" : "No devices found. Tap Refresh to scan."}
+          </Text>
         ) : (
           sortedDevices.map(device => (
             <DeviceCard
@@ -505,13 +515,9 @@ function HeightInput({ label, value, onChange }) {
 // Stage 3 — Calibrate
 // ============================================================================
 function CalibrateStage({
-  config, actions, isScanning, onStartScan,
+  config, actions, isScanning,
   onSaveB1TxPower, onSaveB2TxPower, onSavePathLossN, onAdvance,
 }) {
-  useEffect(() => {
-    if (!isScanning) onStartScan();
-  }, []);
-
   const pipeline1 = actions.getCalibrationPipeline?.(1);
   const pipeline2 = actions.getCalibrationPipeline?.(2);
 
@@ -523,11 +529,12 @@ function CalibrateStage({
           Stand ~1 ft (30 cm) from each beacon and collect samples.
           This sets the TX Power reference for distance estimation.
         </Text>
-        {!isScanning && (
-          <Pressable style={styles.scanBtn} onPress={onStartScan}>
-            <Text style={styles.scanBtnText}>📶 Start Scan</Text>
-          </Pressable>
-        )}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }}>
+          <View style={[styles.scanDot, { backgroundColor: isScanning ? "#1a7f37" : "#cf222e" }]} />
+          <Text style={{ fontSize: 11, color: isScanning ? "#1a7f37" : "#cf222e", fontWeight: "700" }}>
+            {isScanning ? "BLE Scan Active" : "BLE Scan Stopped"}
+          </Text>
+        </View>
       </View>
 
       <CalibrationPanel
@@ -565,7 +572,8 @@ function PositionTestStage({
 }) {
   const isPositioning = moduleState === "POSITIONING";
   const isPaused      = moduleState === "PAUSED";
-  const isStopped     = ["STOPPED", "CALIBRATED", "PLACEMENT_CONFIGURED", "BEACONS_SELECTED"].includes(moduleState);
+  const isStopped     = !isPositioning && !isPaused;  // everything else = show Start button
+
 
   const { bleX = 9, bleY = 7.5, pdrX = 9, pdrY = 7.5,
           fusedX = 9, fusedY = 7.5, confidence = 0 } = positionState || {};
@@ -812,4 +820,7 @@ const styles = StyleSheet.create({
   btnYellow:  { backgroundColor: "#d29922" },
   btnRed:     { backgroundColor: "#cf222e" },
   btnOutline: { backgroundColor: "#fff", borderWidth: 1, borderColor: "#d0d7de" },
+
+  // Scan status dot
+  scanDot: { width: 8, height: 8, borderRadius: 4 },
 });

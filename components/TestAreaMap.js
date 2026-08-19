@@ -42,15 +42,16 @@ export default function TestAreaMap({
   onBeacon1Move,    // (x, y) called during drag
   onBeacon2Move,    // (x, y) called during drag
 }) {
-  // Compute map size — maintain 18:15 aspect ratio
-  const screenWidth  = Dimensions.get("window").width;
-  const mapWidth     = Math.min(screenWidth - 32, 480);
-  const mapHeight    = mapWidth * (ROOM_HEIGHT_FT / ROOM_WIDTH_FT);
-  const PAD = 30; // label padding around the SVG room
-
-  // Total SVG canvas size (room + padding for labels)
-  const svgW = mapWidth  + PAD * 2;
-  const svgH = mapHeight + PAD * 2;
+  // Compute map size — maintain 18:15 aspect ratio and fit inside screen
+  // screenWidth minus the ScrollView padding (16 each side) minus extra room for safety
+  const screenWidth = Dimensions.get("window").width;
+  const PAD = 24;  // label padding inside the SVG canvas
+  // Available width for the full SVG canvas (room + PAD on each side)
+  const availableWidth = screenWidth - 32;  // 16px padding each side from ScrollView
+  const svgW    = availableWidth;
+  const mapWidth  = Math.max(100, svgW - PAD * 2);   // room area width
+  const mapHeight = mapWidth * (ROOM_HEIGHT_FT / ROOM_WIDTH_FT);
+  const svgH    = mapHeight + PAD * 2;
 
   // Conversion helpers (room coordinates, not canvas)
   const toScreen = useCallback(
@@ -174,7 +175,8 @@ export default function TestAreaMap({
         )}
       </View>
 
-      <Svg width={svgW} height={svgH + 20}>
+      <View style={styles.svgWrapper}>
+        <Svg width={svgW} height={svgH}>
         {/* Room background */}
         <Rect x={PAD} y={PAD} width={mapWidth} height={mapHeight}
           fill="#f8fafc" rx="4" stroke="#d0d7de" strokeWidth="1.5" />
@@ -243,6 +245,7 @@ export default function TestAreaMap({
           </SvgText>
         </G>
       </Svg>
+      </View>
 
       {/* Legend */}
       <View style={styles.legend}>
@@ -273,6 +276,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#d0d7de",
     marginBottom: 12,
+    overflow: "hidden",
+    width: "100%",
+  },
+  svgWrapper: {
+    width: "100%",
+    alignItems: "center",
     overflow: "hidden",
   },
   header: {
