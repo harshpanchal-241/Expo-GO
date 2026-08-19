@@ -142,30 +142,16 @@ export default function BleScannerSection() {
   };
 
   // --------------------------------------------------------------------------
-  // Start BLE Scan (Hardware scanning or Expo Go simulation stream)
+  // Start BLE Scan (Hardware scanning)
   // --------------------------------------------------------------------------
   const startScan = async () => {
     try {
       const mgr = managerRef.current;
-
-      // In Expo Go without custom native dev build, run realistic simulation stream
       if (!mgr) {
-        setIsScanning(true);
-        isScanningRef.current = true;
-
-        const simulatedNodes = [
-          { id: "BLE:Beacon:North-101", name: "Indoor Beacon North", baseRssi: -56, velocity: -0.15 },
-          { id: "BLE:Beacon:Gateway-A", name: "Hallway Gateway BLE", baseRssi: -72, velocity: 0.20 },
-          { id: "BLE:Beacon:Entrance", name: "Entrance Node", baseRssi: -84, velocity: 0.0 },
-          { id: "C4:D3:5B:89:12:FA", name: "Smart Tag BLE", baseRssi: -65, velocity: -0.25 },
-        ];
-
-        let simTick = 0;
-        simIntervalRef.current = setInterval(() => {
-          simTick++;
-          simNodesStream(simulatedNodes, simTick);
-        }, 75);
-
+        Alert.alert(
+          "BLE Native Module Required",
+          "Native Bluetooth scanning requires a development build (EAS build) with react-native-ble-plx. Please run on a native Android build."
+        );
         return;
       }
 
@@ -215,25 +201,7 @@ export default function BleScannerSection() {
     }
   };
 
-  // Simulation packet generator for Expo Go
-  const simNodesStream = (nodes, tick) => {
-    nodes.forEach((node) => {
-      const noise = (Math.sin(tick * 0.4 + node.baseRssi) * 2) + ((Math.random() - 0.5) * 1.5);
-      const dynamicRssi = Math.round(node.baseRssi + (Math.sin(tick * 0.08) * 10 * Math.sign(node.velocity || 1)) + noise);
-      const clampedRssi = Math.min(-42, Math.max(-98, dynamicRssi));
-
-      processIncomingPacket(node.id, node.name, clampedRssi, {
-        txPowerLevel: -59,
-        isConnectable: true,
-      });
-    });
-  };
-
   const stopScan = () => {
-    if (simIntervalRef.current) {
-      clearInterval(simIntervalRef.current);
-      simIntervalRef.current = null;
-    }
     const mgr = managerRef.current;
     if (mgr) {
       try {

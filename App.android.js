@@ -174,11 +174,12 @@ export default function AppAndroid() {
             magDeg = norm(magDeg);
             setRawHeading(magDeg);
 
-            if (headingZeroRef.current !== null) {
-              const rel = signed(headingZeroRef.current - magDeg);
-              headingRef.current = rel;
-              setHeading(rel);
+            if (headingZeroRef.current === null) {
+              headingZeroRef.current = magDeg;
             }
+            const rel = signed(headingZeroRef.current - magDeg);
+            headingRef.current = rel;
+            setHeading(rel);
           }
         });
 
@@ -190,24 +191,25 @@ export default function AppAndroid() {
           const raw = norm(alphaDeg(data.rotation.alpha));
           setRawHeading(raw);
 
-          if (headingZeroRef.current !== null) {
-            // Android rotation alpha convention
-            const rel = signed(headingZeroRef.current - raw);
-            let diff = rel - smoothedHeadingRef.current;
-            if (diff > 180) diff -= 360;
-            if (diff < -180) diff += 360;
-
-            smoothedHeadingRef.current = norm(smoothedHeadingRef.current + 0.25 * diff);
-            const formatted = signed(smoothedHeadingRef.current);
-            headingRef.current = formatted;
-            setHeading(formatted);
+          if (headingZeroRef.current === null) {
+            headingZeroRef.current = raw;
           }
+          // Android rotation alpha convention
+          const rel = signed(headingZeroRef.current - raw);
+          let diff = rel - smoothedHeadingRef.current;
+          if (diff > 180) diff -= 360;
+          if (diff < -180) diff += 360;
+
+          smoothedHeadingRef.current = norm(smoothedHeadingRef.current + 0.25 * diff);
+          const formatted = signed(smoothedHeadingRef.current);
+          headingRef.current = formatted;
+          setHeading(formatted);
         });
 
         // 3. Dynamic Accelerometer Step Detector with Weinberg Stride Calculation
         Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
-          if (!runningRef.current) return;
+          if (!runningRef.current && !pdrStepCallbackRef.current) return;
           const { x, y, z } = data;
           const mag = Math.sqrt(x * x + y * y + z * z); // in g
 

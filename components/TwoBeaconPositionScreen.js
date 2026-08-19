@@ -51,7 +51,6 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
   // ─── Hook ─────────────────────────────────────────────────────────────────
   const {
     isScanning,
-    isExpoGoMode,
     bluetoothStatus,
     devices,
     moduleState,
@@ -151,15 +150,6 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
           <Text style={styles.resetBtnText}>Reset</Text>
         </Pressable>
       </View>
-
-      {/* ── Expo Go notice ── */}
-      {isExpoGoMode && (
-        <View style={styles.noticeBanner}>
-          <Text style={styles.noticeText}>
-            ⚠️ Expo Go detected — running with simulated BLE devices. Build with EAS for real BLE.
-          </Text>
-        </View>
-      )}
 
       {/* ── Stage Indicator ── */}
       <StageIndicator stages={STAGES} active={activeStage} onPress={setActiveStage} />
@@ -610,16 +600,34 @@ function PositionTestStage({
 
       {/* Live position metrics */}
       <View style={styles.metricsRow}>
-        <MetricTile label="X Position" value={`${fusedX.toFixed(2)} ft`} highlight />
-        <MetricTile label="Y Position" value={`${fusedY.toFixed(2)} ft`} highlight />
+        <MetricTile label="X (Width)" value={`${fusedX.toFixed(2)} ft`} highlight sub={`${(fusedX / 3.28084).toFixed(2)} m`} />
+        <MetricTile label="Y (Length)" value={`${fusedY.toFixed(2)} ft`} highlight sub={`${(fusedY / 3.28084).toFixed(2)} m`} />
         <MetricTile label="Confidence" value={`${(confidence * 100).toFixed(0)}%`}
           color={confidence > 0.6 ? "#1a7f37" : confidence > 0.3 ? "#d29922" : "#cf222e"} />
+      </View>
+
+      {/* Beacon Distances Row */}
+      <View style={styles.metricsRow}>
+        <MetricTile
+          label={`Dist to B1 (${config.beacon1Name || "B1"})`}
+          value={debugInfo?.b1?.distanceFt != null ? `${debugInfo.b1.distanceFt.toFixed(1)} ft` : "Searching…"}
+          color="#0369a1"
+          sub={debugInfo?.b1?.filteredRssi != null ? `${debugInfo.b1.filteredRssi} dBm` : undefined}
+        />
+        <MetricTile
+          label={`Dist to B2 (${config.beacon2Name || "B2"})`}
+          value={debugInfo?.b2?.distanceFt != null ? `${debugInfo.b2.distanceFt.toFixed(1)} ft` : "Searching…"}
+          color="#6d28d9"
+          sub={debugInfo?.b2?.filteredRssi != null ? `${debugInfo.b2.filteredRssi} dBm` : undefined}
+        />
       </View>
 
       {/* Map */}
       <TestAreaMap
         beacon1={{ x: config.beacon1X, y: config.beacon1Y }}
         beacon2={{ x: config.beacon2X, y: config.beacon2Y }}
+        beacon1Dist={debugInfo?.b1?.distanceFt}
+        beacon2Dist={debugInfo?.b2?.distanceFt}
         userPosition={{ fusedX, fusedY }}
         blePosition={showOverlays ? { bleX, bleY } : null}
         pdrPosition={showOverlays ? { pdrX, pdrY } : null}
@@ -634,7 +642,7 @@ function PositionTestStage({
       <View style={styles.controlRow}>
         {isStopped && (
           <ActionBtn
-            label="▶ Start Test"
+            label="▶ Start Position Test"
             onPress={actions.startPositioning}
             style={styles.btnGreen}
           />
@@ -649,10 +657,20 @@ function PositionTestStage({
           <ActionBtn label="⏹ Stop" onPress={actions.stopPositioning} style={styles.btnRed} />
         )}
       </View>
+
+      {/* Step Testing and Calibration Quick Tools */}
       <View style={styles.controlRow}>
-        <ActionBtn label="↺ Reset Position" onPress={() => { actions.resetPosition?.(); actions.resetPipelines?.(); }} style={styles.btnOutline} />
-        <ActionBtn label="✕ Clear Trail"    onPress={actions.clearTrail}                                                   style={styles.btnOutline} />
-        <ActionBtn label="✎ Edit Placement" onPress={onGoToPlace}                                                          style={styles.btnOutline} />
+        <ActionBtn
+          label="👣 Add Step (+2.3 ft)"
+          onPress={() => actions.addManualStep?.(2.3, 0)}
+          style={[styles.btnOutline, { borderColor: "#1f6feb", backgroundColor: "#f0f8ff" }]}
+        />
+        <ActionBtn label="↺ Reset Pos" onPress={() => { actions.resetPosition?.(); actions.resetPipelines?.(); }} style={styles.btnOutline} />
+        <ActionBtn label="✕ Clear Trail" onPress={actions.clearTrail} style={styles.btnOutline} />
+      </View>
+
+      <View style={styles.controlRow}>
+        <ActionBtn label="✎ Edit Beacon Placement" onPress={onGoToPlace} style={styles.btnOutline} />
       </View>
 
       {/* Debug panel */}
@@ -677,11 +695,12 @@ function BeaconSignalBadge({ label, available }) {
   );
 }
 
-function MetricTile({ label, value, highlight, color }) {
+function MetricTile({ label, value, highlight, color, sub }) {
   return (
     <View style={[styles.metricTile, highlight && styles.metricTileHighlight]}>
       <Text style={styles.metricLabel}>{label}</Text>
       <Text style={[styles.metricValue, color ? { color } : highlight ? { color: "#1d4ed8" } : {}]}>{value}</Text>
+      {sub ? <Text style={{ fontSize: 10, color: "#57606a", marginTop: 2, fontWeight: "600" }}>{sub}</Text> : null}
     </View>
   );
 }

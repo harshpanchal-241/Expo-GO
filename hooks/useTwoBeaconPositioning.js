@@ -38,7 +38,6 @@ export function useTwoBeaconPositioning({
   const [isScanning,       setIsScanning]       = useState(false);
   const [devices,          setDevices]          = useState({});     // id → device meta
   const [bluetoothStatus,  setBluetoothStatus]  = useState("Unknown");
-  const [isExpoGoMode,     setIsExpoGoMode]     = useState(false);
 
   // ─── Module state machine ──────────────────────────────────────────────────
   // IDLE | SCANNING | BEACONS_SELECTED | PLACEMENT_CONFIGURED |
@@ -60,10 +59,8 @@ export function useTwoBeaconPositioning({
   const isScanningRef    = useRef(false);
   const modulStateRef    = useRef("IDLE");
   const managerRef       = useRef(null);
-  const scanSubRef       = useRef(null);
   const calcIntervalRef  = useRef(null);
   const uiIntervalRef    = useRef(null);
-  const simIntervalRef   = useRef(null);
 
   // Per-beacon RSSI pipelines
   const pipeline1Ref = useRef(new RssiFilterPipeline());
@@ -100,8 +97,7 @@ export function useTwoBeaconPositioning({
     managerRef.current = mgr;
 
     if (!mgr) {
-      setIsExpoGoMode(true);
-      setBluetoothStatus("Expo Go / Simulated");
+      setBluetoothStatus("Native BLE required");
       return;
     }
 
@@ -147,13 +143,8 @@ export function useTwoBeaconPositioning({
     if (!granted) return;
 
     const mgr = managerRef.current;
-
     if (!mgr) {
-      // Expo Go simulation — start silently, don't override module state
-      setIsExpoGoMode(true);
-      _startSimulatedScan();
-      isScanningRef.current = true;
-      setIsScanning(true);
+      setBluetoothStatus("BLE Manager Unavailable");
       return;
     }
 
@@ -161,30 +152,29 @@ export function useTwoBeaconPositioning({
 
     isScanningRef.current = true;
     setIsScanning(true);
-    // Note: do NOT call _setModuleState here — state is controlled by stage flow
 
     try {
-      mgr.startDeviceScan(null, { allowDuplicates: true }, (error, device) => {
+      mgr.startDeviceScan(null, { allowDuplicates: true, scanMode: 2 }, (error, device) => {
         if (error || !device) return;
         const now   = Date.now();
         const rssi  = device.rssi ?? null;
         const id    = device.id;
         const name  = device.name || device.localName || "";
 
-        // Store device meta
+        // Store real device metadata
         deviceMetaRef.current[id] = {
           id,
-          name: name || `Unknown (${id.slice(-5)})`,
+          name: name || `BLE Device (${id.slice(-5)})`,
           rssi,
           lastSeen: now,
         };
 
-        // Route to selected beacon pipelines
+        // Route to selected beacon pipelines (case-insensitive ID matching)
         const cfg = configRef.current;
-        if (cfg.beacon1Id && id === cfg.beacon1Id && rssi !== null) {
+        if (cfg.beacon1Id && id.toLowerCase() === cfg.beacon1Id.toLowerCase() && rssi !== null) {
           pipeline1Ref.current.addPacket(rssi, now);
         }
-        if (cfg.beacon2Id && id === cfg.beacon2Id && rssi !== null) {
+        if (cfg.beacon2Id && id.toLowerCase() === cfg.beacon2Id.toLowerCase() && rssi !== null) {
           pipeline2Ref.current.addPacket(rssi, now);
         }
       });
@@ -200,33 +190,8 @@ export function useTwoBeaconPositioning({
 
     const mgr = managerRef.current;
     try { mgr?.stopDeviceScan?.(); } catch (e) { /* ignore */ }
-
-    if (simIntervalRef.current) {
-      clearInterval(simIntervalRef.current);
-      simIntervalRef.current = null;
-    }
   }, []);
 
-  // ─── SIMULATED SCAN (Expo Go) ─────────────────────────────────────────────
-  function _startSimulatedScan() {
-    if (simIntervalRef.current) return;
-    const simDevices = [
-      { id: "SIM:AA:BB:CC:DD:01", name: "Galaxy Buds (Sim B1)" },
-      { id: "SIM:AA:BB:CC:DD:02", name: "Earbud Right (Sim B2)" },
-      { id: "SIM:AA:BB:CC:DD:03", name: "Unknown BLE Device" },
-    ];
-
-    simIntervalRef.current = setInterval(() => {
-      const now = Date.now();
-      simDevices.forEach(d => {
-        const rssi = -60 + Math.floor(Math.random() * 20) - 10;
-        deviceMetaRef.current[d.id] = { id: d.id, name: d.name, rssi, lastSeen: now };
-        const cfg = configRef.current;
-        if (cfg.beacon1Id === d.id) pipeline1Ref.current.addPacket(rssi, now);
-        if (cfg.beacon2Id === d.id) pipeline2Ref.current.addPacket(rssi, now);
-      });
-    }, 500);
-  }
 
   // ─── UI UPDATE LOOP ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -272,6 +237,8 @@ export function useTwoBeaconPositioning({
   function _runPositionCalculation() {
     const cfg = configRef.current;
     const now = Date.now();
+    const dtSeconds = Math.max(0.05, Math.min(1.0, (now - lastCalcTime.current) / 1000));
+    lastCalcTime.current = now;
 
     // Get pipeline states
     const s1 = pipeline1Ref.current.getState();
@@ -292,7 +259,7 @@ export function useTwoBeaconPositioning({
 
     const prevFused = prevFusedRef.current;
 
-    // Raw BLE estimate (for motion consistency scoring)
+    // Raw BLE estimate
     const rawBle = solveTwoBeaconPosition(
       { x: cfg.beacon1X, y: cfg.beacon1Y },
       { x: cfg.beacon2X, y: cfg.beacon2Y },
@@ -336,24 +303,23 @@ export function useTwoBeaconPositioning({
       prevFused.x, prevFused.y,
     );
 
-    // Sanity check — reject teleport
-    const dtMs = now - lastCalcTime.current;
-    const sane = isSaneMovement(prevFused.x, prevFused.y, bleSol.x, bleSol.y, dtMs);
-    lastCalcTime.current = now;
+    // Update Kalman error covariance over elapsed time (prevents covariance freeze)
+    kalmanRef.current.timeUpdate(dtSeconds);
 
-    let effectiveConf = bleSol.confidence;
-    if (!sane) effectiveConf *= 0.1;
-
-    // Kalman update with BLE
-    kalmanRef.current.update(bleSol.x, bleSol.y, effectiveConf);
+    // Update Kalman filter with BLE measurement if any distance is available
+    if (d1 !== null || d2 !== null) {
+      kalmanRef.current.update(bleSol.x, bleSol.y, bleSol.confidence);
+    }
 
     const fused = kalmanRef.current.getPosition();
     const pdr   = pdrPosRef.current;
 
     // Trail update
     const trail = trailRef.current;
-    trail.push({ x: fused.x, y: fused.y });
-    if (trail.length > MAX_TRAIL_POINTS) trail.shift();
+    if (trail.length === 0 || Math.hypot(fused.x - trail[trail.length - 1].x, fused.y - trail[trail.length - 1].y) > 0.15) {
+      trail.push({ x: fused.x, y: fused.y });
+      if (trail.length > MAX_TRAIL_POINTS) trail.shift();
+    }
 
     // Store refs
     prevFusedRef.current = fused;
@@ -369,7 +335,7 @@ export function useTwoBeaconPositioning({
       pdrY:       pdr.y,
       fusedX:     fused.x,
       fusedY:     fused.y,
-      confidence: effectiveConf,
+      confidence: bleSol.confidence,
     };
 
     // Debug ref
@@ -379,9 +345,9 @@ export function useTwoBeaconPositioning({
       bleX: bleSol.x, bleY: bleSol.y,
       pdrX: pdr.x,    pdrY: pdr.y,
       fusedX: fused.x, fusedY: fused.y,
-      confidence: effectiveConf,
-      b1Available: s1.filteredRssi !== null && age1 < 2000,
-      b2Available: s2.filteredRssi !== null && age2 < 2000,
+      confidence: bleSol.confidence,
+      b1Available: s1.filteredRssi !== null && age1 < 3000,
+      b2Available: s2.filteredRssi !== null && age2 < 3000,
     };
   }
 
@@ -408,7 +374,7 @@ export function useTwoBeaconPositioning({
       lastCalcTime.current = Date.now();
 
       // Push initial position immediately so the map dot appears right away
-      positionRef.current = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, confidence: 0 };
+      positionRef.current = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, confidence: 0.5 };
       setPositionState({ ...positionRef.current, timestamp: Date.now() });
       setTrail([{ x: cx, y: cy }]);
 
@@ -434,11 +400,36 @@ export function useTwoBeaconPositioning({
     },
 
     resetPosition: () => {
-      kalmanRef.current.reset(9, 7.5);
-      pdrPosRef.current    = { x: 9, y: 7.5 };
-      prevFusedRef.current = { x: 9, y: 7.5 };
-      trailRef.current     = [];
-      positionRef.current  = { bleX: 9, bleY: 7.5, pdrX: 9, pdrY: 7.5, fusedX: 9, fusedY: 7.5, confidence: 0 };
+      const cx = (configRef.current.beacon1X + configRef.current.beacon2X) / 2;
+      const cy = (configRef.current.beacon1Y + configRef.current.beacon2Y) / 2;
+      kalmanRef.current.reset(cx, cy);
+      pdrPosRef.current    = { x: cx, y: cy };
+      prevFusedRef.current = { x: cx, y: cy };
+      trailRef.current     = [{ x: cx, y: cy }];
+      positionRef.current  = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, confidence: 0 };
+      setPositionState({ ...positionRef.current, timestamp: Date.now() });
+      setTrail([{ x: cx, y: cy }]);
+    },
+
+    addManualStep: (stepFt = 2.3, headingDeg = 0) => {
+      const rad = (headingDeg * Math.PI) / 180;
+      const dx = stepFt * Math.sin(rad);
+      const dy = stepFt * Math.cos(rad);
+      const old = pdrPosRef.current;
+      pdrPosRef.current = clampToRoom(old.x + dx, old.y + dy);
+      kalmanRef.current.predict(dx, dy);
+      const fused = kalmanRef.current.getPosition();
+      trailRef.current.push({ x: fused.x, y: fused.y });
+      if (trailRef.current.length > MAX_TRAIL_POINTS) trailRef.current.shift();
+      positionRef.current = {
+        ...positionRef.current,
+        pdrX: pdrPosRef.current.x,
+        pdrY: pdrPosRef.current.y,
+        fusedX: fused.x,
+        fusedY: fused.y,
+      };
+      setPositionState({ ...positionRef.current, timestamp: Date.now() });
+      setTrail([...trailRef.current]);
     },
 
     clearTrail: () => { trailRef.current = []; setTrail([]); },
@@ -457,6 +448,7 @@ export function useTwoBeaconPositioning({
     advanceToCalibrated:      () => _setModuleState("CALIBRATED"),
   };
 
+
   // ─── Cleanup on unmount ───────────────────────────────────────────────────
   useEffect(() => {
     return () => {
@@ -469,7 +461,6 @@ export function useTwoBeaconPositioning({
   return {
     // State
     isScanning,
-    isExpoGoMode,
     bluetoothStatus,
     devices,          // all scanned devices for display
     moduleState,

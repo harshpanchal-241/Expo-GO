@@ -234,74 +234,129 @@ export function computeWeight({
 }
 
 // ============================================================================
-// TWO-BEACON POSITION SOLVER  (coarse-to-fine grid search)
+// TWO-BEACON POSITION SOLVER
+// Fast analytical circle intersection + weighted least-squares refinement
 // ============================================================================
 export function solveTwoBeaconPosition(b1, b2, d1, d2, w1, w2, prevX = 9, prevY = 7.5) {
-  // b1/b2 = { x, y }  in feet
+  // b1/b2 = { x, y } in feet
   // d1/d2 = estimated distances to B1/B2 in feet
   // w1/w2 = weights 0..1
 
-  if (d1 === null && d2 === null) return { x: prevX, y: prevY, confidence: 0 };
+  if ((d1 === null || isNaN(d1)) && (d2 === null || isNaN(d2))) {
+    return { x: prevX, y: prevY, confidence: 0 };
+  }
 
-  const safeW1 = d1 !== null ? w1 : 0;
-  const safeW2 = d2 !== null ? w2 : 0;
+  const safeW1 = (d1 !== null && !isNaN(d1)) ? Math.max(0, w1) : 0;
+  const safeW2 = (d2 !== null && !isNaN(d2)) ? Math.max(0, w2) : 0;
   const totalW = safeW1 + safeW2;
 
   if (totalW === 0) return { x: prevX, y: prevY, confidence: 0 };
 
-  // If only one beacon available — constrain along its circle, biased to prev
-  if (d1 === null || safeW1 < 0.05) return _oneBeaconEstimate(b2, d2, prevX, prevY);
-  if (d2 === null || safeW2 < 0.05) return _oneBeaconEstimate(b1, d1, prevX, prevY);
+  // If only one beacon available — constrain along its circle, biased to prev position
+  if (d1 === null || isNaN(d1) || safeW1 < 0.05) return _oneBeaconEstimate(b2, d2, prevX, prevY);
+  if (d2 === null || isNaN(d2) || safeW2 < 0.05) return _oneBeaconEstimate(b1, d1, prevX, prevY);
 
-  // Coarse pass: 18×15 grid at 0.5 ft resolution
-  const coarseStep = 0.5;
-  let bestX = prevX, bestY = prevY, bestErr = Infinity;
+  // Both beacons available — analytical 2-circle intersection
+  const dx = b2.x - b1.x;
+  const dy = b2.y - b1.y;
+  const D = Math.hypot(dx, dy);
 
-  for (let x = 0; x <= ROOM_WIDTH_FT; x += coarseStep) {
-    for (let y = 0; y <= ROOM_HEIGHT_FT; y += coarseStep) {
-      const distToB1 = Math.hypot(x - b1.x, y - b1.y);
-      const distToB2 = Math.hypot(x - b2.x, y - b2.y);
-      const err =
-        safeW1 * (distToB1 - d1) ** 2 +
-        safeW2 * (distToB2 - d2) ** 2;
-      if (err < bestErr) { bestErr = err; bestX = x; bestY = y; }
+  let candidateX = prevX;
+  let candidateY = prevY;
+
+  if (D > 0.1) {
+    const ux = dx / D;
+    const uy = dy / D;
+
+    // Baseline projection distance from B1
+    let a = (d1 * d1 - d2 * d2 + D * D) / (2 * D);
+    // Clamp 'a' to reasonable bounds between beacons
+    if (d1 + d2 < D) {
+      // Circles too small to touch — take proportional point along baseline
+      a = (d1 / (d1 + d2)) * D;
+    } else if (Math.abs(d1 - d2) > D) {
+      // One circle inside another
+      a = d1 < d2 ? d1 : D - d2;
+    }
+
+    const hSq = d1 * d1 - a * a;
+    const p0x = b1.x + a * ux;
+    const p0y = b1.y + a * uy;
+
+    if (hSq > 0) {
+      const h = Math.sqrt(hSq);
+      // Two possible intersection points (perpendicular to baseline)
+      const p1x = p0x - h * uy;
+      const p1y = p0y + h * ux;
+      const p2x = p0x + h * uy;
+      const p2y = p0y - h * ux;
+
+      // Pick the point inside the room [0..18, 0..15] or closest to previous / room center
+      const p1In = p1x >= -0.5 && p1x <= ROOM_WIDTH_FT + 0.5 && p1y >= -0.5 && p1y <= ROOM_HEIGHT_FT + 0.5;
+      const p2In = p2x >= -0.5 && p2x <= ROOM_WIDTH_FT + 0.5 && p2y >= -0.5 && p2y <= ROOM_HEIGHT_FT + 0.5;
+
+      if (p1In && !p2In) {
+        candidateX = p1x; candidateY = p1y;
+      } else if (p2In && !p1In) {
+        candidateX = p2x; candidateY = p2y;
+      } else {
+        // Both in or both out — choose closest to previous position
+        const dist1 = Math.hypot(p1x - prevX, p1y - prevY);
+        const dist2 = Math.hypot(p2x - prevX, p2y - prevY);
+        if (dist1 <= dist2) {
+          candidateX = p1x; candidateY = p1y;
+        } else {
+          candidateX = p2x; candidateY = p2y;
+        }
+      }
+    } else {
+      // Midpoint on baseline
+      candidateX = p0x;
+      candidateY = p0y;
     }
   }
 
-  // Fine pass: 1 ft region around coarse best at 0.05 ft resolution
-  const fineStep = 0.05;
-  const fineRange = 1.0;
-  for (let x = bestX - fineRange; x <= bestX + fineRange; x += fineStep) {
-    for (let y = bestY - fineRange; y <= bestY + fineRange; y += fineStep) {
-      const cx = Math.max(0, Math.min(ROOM_WIDTH_FT,  x));
-      const cy = Math.max(0, Math.min(ROOM_HEIGHT_FT, y));
-      const distToB1 = Math.hypot(cx - b1.x, cy - b1.y);
-      const distToB2 = Math.hypot(cx - b2.x, cy - b2.y);
-      const err =
-        safeW1 * (distToB1 - d1) ** 2 +
-        safeW2 * (distToB2 - d2) ** 2;
-      if (err < bestErr) { bestErr = err; bestX = cx; bestY = cy; }
+  // Fine-tune around candidate with localized least-squares search
+  let bestX = candidateX;
+  let bestY = candidateY;
+  let bestErr = Infinity;
+  const searchRange = 2.0; // 2 ft around analytical solution
+  const step = 0.2;        // 0.2 ft precision
+
+  for (let x = Math.max(0, candidateX - searchRange); x <= Math.min(ROOM_WIDTH_FT, candidateX + searchRange); x += step) {
+    for (let y = Math.max(0, candidateY - searchRange); y <= Math.min(ROOM_HEIGHT_FT, candidateY + searchRange); y += step) {
+      const dist1 = Math.hypot(x - b1.x, y - b1.y);
+      const dist2 = Math.hypot(x - b2.x, y - b2.y);
+      const err = safeW1 * (dist1 - d1) ** 2 + safeW2 * (dist2 - d2) ** 2;
+      if (err < bestErr) {
+        bestErr = err;
+        bestX = x;
+        bestY = y;
+      }
     }
   }
 
-  const clamped  = clampToRoom(bestX, bestY);
-  const totalErr = Math.sqrt(bestErr / (safeW1 + safeW2));
-  const confidence = Math.max(0, Math.min(1, 1 - totalErr / 10));
+  const clamped = clampToRoom(bestX, bestY);
+  const totalErr = isFinite(bestErr) ? Math.sqrt(bestErr / (safeW1 + safeW2)) : 5;
+  const confidence = Math.max(0.2, Math.min(1.0, 1 - totalErr / 12));
 
   return { x: clamped.x, y: clamped.y, confidence };
 }
 
 function _oneBeaconEstimate(beacon, dist, prevX, prevY) {
-  // Use bearing from beacon toward previous position, at dist
-  const angle = Math.atan2(prevY - beacon.y, prevX - beacon.x);
-  const ex    = beacon.x + dist * Math.cos(angle);
-  const ey    = beacon.y + dist * Math.sin(angle);
+  if (!dist || dist <= 0) return { x: prevX, y: prevY, confidence: 0.2 };
+  // Use bearing from beacon toward previous position, at distance
+  let angle = Math.atan2(prevY - beacon.y, prevX - beacon.x);
+  if (isNaN(angle)) angle = 0;
+  const ex = beacon.x + dist * Math.cos(angle);
+  const ey = beacon.y + dist * Math.sin(angle);
   const clamped = clampToRoom(ex, ey);
-  return { x: clamped.x, y: clamped.y, confidence: 0.3 };
+  return { x: clamped.x, y: clamped.y, confidence: 0.35 };
 }
 
 // ============================================================================
-// ADAPTIVE KALMAN FILTER 2D  (X, Y independent 1D filters)
+// ADAPTIVE KALMAN FILTER 2D
+// Smooth, fast-converging 2D filter with anti-freeze process noise updates
 // ============================================================================
 export class AdaptiveKalman2D {
   constructor() {
@@ -309,60 +364,79 @@ export class AdaptiveKalman2D {
   }
 
   reset(initX = 9, initY = 7.5) {
-    // State estimate
+    // State estimate (coordinates in feet)
     this.x  = initX;
     this.y  = initY;
     // Error covariance
-    this.Px = 10;
-    this.Py = 10;
-    // Process noise (PDR uncertainty grows with each step)
-    this.Qx = 0.1;
-    this.Qy = 0.1;
-    // Measurement noise (BLE) — adapted by confidence
-    this.R_base = 2.0;
+    this.Px = 4.0;
+    this.Py = 4.0;
+    // Process noise rate (ft²/s) — uncertainty grows smoothly over time
+    this.Qx = 0.8;
+    this.Qy = 0.8;
+    // Measurement noise baseline (ft²)
+    this.R_base = 1.2;
   }
 
   /**
-   * PDR prediction step.
+   * Time update step (called on calculation interval dt).
+   * Ensures uncertainty grows when no steps/measurements are received so filter never freezes.
+   */
+  timeUpdate(dtSeconds = 0.1) {
+    const dt = Math.max(0.02, Math.min(0.5, dtSeconds));
+    this.Px += this.Qx * dt;
+    this.Py += this.Qy * dt;
+    // Bound covariance
+    this.Px = Math.min(this.Px, 15.0);
+    this.Py = Math.min(this.Py, 15.0);
+  }
+
+  /**
+   * PDR step prediction.
    * dx/dy in feet.
    */
   predict(dx, dy) {
     this.x  += dx;
     this.y  += dy;
-    this.Px += this.Qx;
-    this.Py += this.Qy;
-    // Clamp to room
+    this.Px += 1.0;
+    this.Py += 1.0;
+    // Clamp to room bounds
     const c = clampToRoom(this.x, this.y);
-    this.x = c.x; this.y = c.y;
+    this.x = c.x;
+    this.y = c.y;
   }
 
   /**
    * BLE measurement update.
    * bleX/bleY in feet.
-   * confidence 0..1 (high = trust BLE more = lower R)
+   * confidence 0..1
    */
-  update(bleX, bleY, confidence) {
+  update(bleX, bleY, confidence = 0.5) {
     if (bleX === null || bleY === null || isNaN(bleX) || isNaN(bleY)) return;
 
-    const clampedConf = Math.max(0.01, Math.min(1, confidence));
-    // Adaptive R: high confidence → small R → believe BLE
-    const R = this.R_base / clampedConf;
+    // Ensure error covariance never drops to zero
+    this.Px = Math.max(this.Px, 0.4);
+    this.Py = Math.max(this.Py, 0.4);
 
-    // Kalman gain
+    const conf = Math.max(0.1, Math.min(1.0, confidence));
+    // Measurement noise: higher confidence = smaller R = trust BLE more
+    const R = this.R_base / conf;
+
+    // Kalman gains
     const Kx = this.Px / (this.Px + R);
     const Ky = this.Py / (this.Py + R);
 
-    // Update estimate
+    // Update state estimate
     this.x += Kx * (bleX - this.x);
     this.y += Ky * (bleY - this.y);
 
-    // Update covariance
+    // Update error covariance
     this.Px = (1 - Kx) * this.Px;
     this.Py = (1 - Ky) * this.Py;
 
-    // Clamp
+    // Clamp inside room boundaries
     const c = clampToRoom(this.x, this.y);
-    this.x = c.x; this.y = c.y;
+    this.x = c.x;
+    this.y = c.y;
   }
 
   getPosition() {
@@ -371,12 +445,13 @@ export class AdaptiveKalman2D {
 }
 
 // ============================================================================
-// MOVEMENT SANITY CHECK  (prevent teleport)
+// MOVEMENT SANITY CHECK
 // ============================================================================
 export function isSaneMovement(prevX, prevY, newX, newY, dtMs) {
-  if (dtMs <= 0) return false;
-  const distFt    = Math.hypot(newX - prevX, newY - prevY);
-  const speedFtS  = distFt / (dtMs / 1000);
-  // Normal human walking max ~10 ft/s
-  return speedFtS <= 10;
+  if (dtMs <= 0) return true;
+  const distFt = Math.hypot(newX - prevX, newY - prevY);
+  // In an 18x15 ft room, allow up to 25 ft/s to permit natural movement and fast convergence
+  const speedFtS = distFt / Math.max(0.05, dtMs / 1000);
+  return speedFtS <= 25;
 }
+

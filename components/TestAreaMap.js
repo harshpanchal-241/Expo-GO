@@ -33,9 +33,11 @@ const GRID_STEP_FT = 3; // 3 ft grid lines
 export default function TestAreaMap({
   beacon1,          // { x, y } in feet
   beacon2,          // { x, y } in feet
+  beacon1Dist,      // estimated distance to B1 in feet
+  beacon2Dist,      // estimated distance to B2 in feet
   userPosition,     // { fusedX, fusedY } — fused position
   blePosition,      // { bleX, bleY }   — raw BLE (optional overlay)
-  pdrPosition,      // { pdrX, pdrY }   — PDR (optional overlay)
+  pdrPosition,      // { pdrX, pdrY }   // PDR (optional overlay)
   trail,            // [{ x, y }, ...] in feet
   isSetupMode,      // true → beacons draggable
   showDebugOverlays,// show raw BLE + PDR dots
@@ -188,12 +190,38 @@ export default function TestAreaMap({
         {xLabels}
         {yLabels}
 
+        {/* Distance ranging circles from Beacon 1 and Beacon 2 */}
+        {beacon1Dist && beacon1Dist > 0 && (
+          <Circle
+            cx={b1s.sx}
+            cy={b1s.sy}
+            r={(beacon1Dist / ROOM_WIDTH_FT) * mapWidth}
+            stroke="#0ea5e9"
+            strokeWidth="1.5"
+            strokeDasharray="4,4"
+            fill="none"
+            opacity={0.35}
+          />
+        )}
+        {beacon2Dist && beacon2Dist > 0 && (
+          <Circle
+            cx={b2s.sx}
+            cy={b2s.sy}
+            r={(beacon2Dist / ROOM_WIDTH_FT) * mapWidth}
+            stroke="#8b5cf6"
+            strokeWidth="1.5"
+            strokeDasharray="4,4"
+            fill="none"
+            opacity={0.35}
+          />
+        )}
+
         {/* Trail */}
         {trail && trail.length > 1 && (
           <Polyline points={trailPts} fill="none"
-            stroke="#7c3aed" strokeWidth="2"
+            stroke="#7c3aed" strokeWidth="2.5"
             strokeLinejoin="round" strokeLinecap="round"
-            opacity={0.6} />
+            opacity={0.65} />
         )}
 
         {/* Debug overlays — raw BLE & PDR dots */}
@@ -213,18 +241,22 @@ export default function TestAreaMap({
         {/* User position marker */}
         <G>
           {/* Pulse ring */}
-          <Circle cx={userS.sx} cy={userS.sy} r="16" fill="#1d4ed8" opacity={0.15} />
-          <Circle cx={userS.sx} cy={userS.sy} r="10" fill="#1d4ed8" opacity={0.3} />
+          <Circle cx={userS.sx} cy={userS.sy} r="18" fill="#1d4ed8" opacity={0.12} />
+          <Circle cx={userS.sx} cy={userS.sy} r="11" fill="#1d4ed8" opacity={0.25} />
           {/* Main marker */}
-          <Circle cx={userS.sx} cy={userS.sy} r="7" fill="#1d4ed8" stroke="#fff" strokeWidth="2" />
-          <SvgText x={userS.sx} y={userS.sy + 20} fontSize="10"
+          <Circle cx={userS.sx} cy={userS.sy} r="7.5" fill="#1d4ed8" stroke="#fff" strokeWidth="2" />
+          <SvgText x={userS.sx} y={userS.sy + 18} fontSize="10"
             fill="#1e3a8a" fontWeight="bold" textAnchor="middle">YOU</SvgText>
+          <SvgText x={userS.sx} y={userS.sy + 30} fontSize="8.5"
+            fill="#1d4ed8" fontWeight="600" textAnchor="middle">
+            {(userPosition?.fusedX ?? 9).toFixed(1)}, {(userPosition?.fusedY ?? 7.5).toFixed(1)} ft
+          </SvgText>
         </G>
 
         {/* Beacon 1 marker */}
         <G {...(isSetupMode ? pan1.panHandlers : {})}>
-          <Circle cx={b1s.sx} cy={b1s.sy} r="13" fill="#0ea5e9" opacity={0.2} />
-          <Circle cx={b1s.sx} cy={b1s.sy} r="9"  fill="#0ea5e9" stroke="#fff" strokeWidth="1.5" />
+          <Circle cx={b1s.sx} cy={b1s.sy} r="14" fill="#0ea5e9" opacity={0.2} />
+          <Circle cx={b1s.sx} cy={b1s.sy} r="9.5"  fill="#0ea5e9" stroke="#fff" strokeWidth="1.5" />
           <SvgText x={b1s.sx} y={b1s.sy + 4} fontSize="9"
             fill="#fff" fontWeight="bold" textAnchor="middle">B1</SvgText>
           <SvgText x={b1s.sx} y={b1s.sy + 20} fontSize="8"
@@ -235,8 +267,8 @@ export default function TestAreaMap({
 
         {/* Beacon 2 marker */}
         <G {...(isSetupMode ? pan2.panHandlers : {})}>
-          <Circle cx={b2s.sx} cy={b2s.sy} r="13" fill="#8b5cf6" opacity={0.2} />
-          <Circle cx={b2s.sx} cy={b2s.sy} r="9"  fill="#8b5cf6" stroke="#fff" strokeWidth="1.5" />
+          <Circle cx={b2s.sx} cy={b2s.sy} r="14" fill="#8b5cf6" opacity={0.2} />
+          <Circle cx={b2s.sx} cy={b2s.sy} r="9.5"  fill="#8b5cf6" stroke="#fff" strokeWidth="1.5" />
           <SvgText x={b2s.sx} y={b2s.sy + 4} fontSize="9"
             fill="#fff" fontWeight="bold" textAnchor="middle">B2</SvgText>
           <SvgText x={b2s.sx} y={b2s.sy + 20} fontSize="8"
