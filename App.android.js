@@ -16,6 +16,7 @@ import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-senso
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import BleScannerSection from "./components/BleScannerSection.js";
 import OtaUpdateCard from "./components/OtaUpdateCard.js";
+import TwoBeaconPositionScreen from "./components/TwoBeaconPositionScreen.js";
 
 const norm = d => {
   let x = d % 360;
@@ -54,8 +55,11 @@ export default function AppAndroid() {
   const [savedPaths, setSavedPaths] = useState([]);
   const [selectedPreviousPath, setSelectedPreviousPath] = useState(null);
 
-  // Mode switch: 'pdr' | 'ble'
+  // Mode switch: 'pdr' | 'ble' | 'beacon'
   const [activeTab, setActiveTab] = useState("pdr");
+
+  // PDR step callback ref — the 2-beacon positioning hook attaches here
+  const pdrStepCallbackRef = useRef(null);
 
   const runningRef = useRef(false);
   const headingRef = useRef(0);
@@ -114,6 +118,11 @@ export default function AppAndroid() {
       console.log(`[Dynamic PDR Step #${nextCount}] Dynamic SL: ${len.toFixed(2)}m (Bounce: ${bounceAmp.toFixed(2)}g) | Heading: ${curHeading.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
       return nextCount;
     });
+
+    // Feed step into 2-beacon module if it is listening
+    if (pdrStepCallbackRef.current) {
+      pdrStepCallbackRef.current({ stepLengthMeters: len, heading: curHeading });
+    }
   };
 
   // --------------------------------------------------------------------------
@@ -389,7 +398,7 @@ export default function AppAndroid() {
             style={[s.tabBtn, activeTab === "pdr" && s.tabBtnActive]}
           >
             <Text style={[s.tabBtnText, activeTab === "pdr" && s.tabBtnTextActive]}>
-              🚶 PDR Step Tracking
+              🚶 PDR
             </Text>
           </Pressable>
           <Pressable
@@ -397,12 +406,22 @@ export default function AppAndroid() {
             style={[s.tabBtn, activeTab === "ble" && s.tabBtnActive]}
           >
             <Text style={[s.tabBtnText, activeTab === "ble" && s.tabBtnTextActive]}>
-              📶 BLE Beacon Scanner
+              📶 BLE Scan
+            </Text>
+          </Pressable>
+          <Pressable
+            onPress={() => setActiveTab("beacon")}
+            style={[s.tabBtn, activeTab === "beacon" && s.tabBtnActive]}
+          >
+            <Text style={[s.tabBtnText, activeTab === "beacon" && s.tabBtnTextActive]}>
+              🛰️ 2-Beacon
             </Text>
           </Pressable>
         </View>
 
-        {activeTab === "ble" ? (
+        {activeTab === "beacon" ? (
+          <TwoBeaconPositionScreen pdrStepCallbackRef={pdrStepCallbackRef} />
+        ) : activeTab === "ble" ? (
           <BleScannerSection />
         ) : (
           <>
