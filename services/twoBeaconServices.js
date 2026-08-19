@@ -37,18 +37,21 @@ export function clampToRoom(x, y) {
 
 // ============================================================================
 // RSSI FILTER PIPELINE (per-beacon)
+// Multi-stage filtering: Outlier rejection -> Rolling Median -> One-Euro Filter -> Exponential Moving Average
 // ============================================================================
-const RSSI_BUFFER_SIZE = 5;      // rolling sample buffer
+const RSSI_BUFFER_SIZE = 7;      // rolling sample buffer for median
 const RSSI_MIN = -115;           // reject impossible low
 const RSSI_MAX = -10;            // reject impossible high
 
 export class RssiFilterPipeline {
   constructor() {
-    this.buffer       = [];
-    this.oneEuro      = new OneEuroFilter(1.0, 0.3);  // smooth for positioning
-    this.rawRssi      = null;
-    this.filteredRssi = null;
-    this.lastSeen     = null;
+    this.buffer          = [];
+    // Ultra-smooth OneEuroFilter: low minCutoff (0.25) eliminates jitter when stationary, beta (0.05) tracks motion
+    this.oneEuro         = new OneEuroFilter(0.25, 0.05);
+    this.rawRssi         = null;
+    this.filteredRssi    = null;
+    this.smoothedDistance= null;
+    this.lastSeen        = null;
   }
 
   addPacket(rawRssi, timestamp = Date.now()) {
@@ -62,29 +65,39 @@ export class RssiFilterPipeline {
     this.buffer.push(rawRssi);
     if (this.buffer.length > RSSI_BUFFER_SIZE) this.buffer.shift();
 
-    // Median
+    // Median filter to strip impulse spikes
     const sorted = [...this.buffer].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)];
 
-    // One-Euro on top of median
-    this.filteredRssi = this.oneEuro.filter(median, timestamp);
+    // One-Euro filter on top of median for sub-dBm smooth progression
+    const smoothVal = this.oneEuro.filter(median, timestamp);
+    
+    // EMA blending for maximum stability
+    if (this.filteredRssi === null) {
+      this.filteredRssi = smoothVal;
+    } else {
+      this.filteredRssi = 0.35 * smoothVal + 0.65 * this.filteredRssi;
+    }
+
     return true;
   }
 
   getState() {
     return {
       rawRssi:      this.rawRssi,
-      filteredRssi: this.filteredRssi !== null ? Math.round(this.filteredRssi) : null,
+      // Retain continuous floating point precision for distance calculation, rounded for UI display
+      filteredRssi: this.filteredRssi !== null ? Number(this.filteredRssi.toFixed(2)) : null,
       lastSeen:     this.lastSeen,
     };
   }
 
   reset() {
-    this.buffer       = [];
-    this.oneEuro      = new OneEuroFilter(1.0, 0.3);
-    this.rawRssi      = null;
-    this.filteredRssi = null;
-    this.lastSeen     = null;
+    this.buffer          = [];
+    this.oneEuro         = new OneEuroFilter(0.25, 0.05);
+    this.rawRssi         = null;
+    this.filteredRssi    = null;
+    this.smoothedDistance= null;
+    this.lastSeen        = null;
   }
 
   // Collect calibration samples for N ms, return median RSSI
@@ -108,28 +121,38 @@ export class RssiFilterPipeline {
 }
 
 // ============================================================================
-// RSSI → DISTANCE  (path-loss model, returns meters then converted to feet)
+// RSSI → DISTANCE  (smooth path-loss model, returns feet)
 // ============================================================================
-export function rssiToDistance(filteredRssi, txPower, n) {
-  if (filteredRssi === null || filteredRssi === 0) return null;
-  const ratio    = (txPower - filteredRssi) / (10 * n);
+export function rssiToDistance(filteredRssi, txPower, n, prevDistFt = null) {
+  if (filteredRssi === null || filteredRssi === 0 || isNaN(filteredRssi)) return null;
+  const ratio    = (txPower - filteredRssi) / (10 * Math.max(1.0, n));
   const meters   = Math.pow(10, ratio);
-  const feet     = meters * 3.28084;
-  return isFinite(feet) && feet >= 0 ? feet : null;
+  const rawFeet  = meters * 3.28084;
+  if (!isFinite(rawFeet) || rawFeet < 0) return null;
+
+  // If previous distance exists, smoothly blend to eliminate step transitions
+  if (prevDistFt !== null && prevDistFt > 0) {
+    // Adaptive smoothing factor: small changes smoothed heavily, large changes track quickly
+    const diff = Math.abs(rawFeet - prevDistFt);
+    const alpha = diff > 4.0 ? 0.40 : diff > 1.5 ? 0.25 : 0.15;
+    return Number((alpha * rawFeet + (1 - alpha) * prevDistFt).toFixed(2));
+  }
+
+  return Number(rawFeet.toFixed(2));
 }
 
 // ============================================================================
 // HEIGHT CORRECTION  (slant → horizontal distance, in same units)
 // ============================================================================
 export function applyHeightCorrection(slantDist, beaconHeightFt, phoneHeightFt) {
-  if (slantDist === null) return { correctedDist: null, heightValidity: 0 };
+  if (slantDist === null || isNaN(slantDist)) return { correctedDist: null, heightValidity: 0 };
   const vertDiff = Math.abs(beaconHeightFt - phoneHeightFt);
   const slantSq  = slantDist * slantDist;
   const vertSq   = vertDiff  * vertDiff;
 
   if (slantDist < vertDiff) {
     // Physically inconsistent reading
-    return { correctedDist: 0, heightValidity: 0.1 };
+    return { correctedDist: 0.1, heightValidity: 0.1 };
   }
   const horizontal = Math.sqrt(Math.max(0, slantSq - vertSq));
   const validity   = Math.min(1, slantDist / Math.max(1, vertDiff + 1));
@@ -368,26 +391,26 @@ export class AdaptiveKalman2D {
     this.x  = initX;
     this.y  = initY;
     // Error covariance
-    this.Px = 4.0;
-    this.Py = 4.0;
-    // Process noise rate (ft²/s) — uncertainty grows smoothly over time
-    this.Qx = 0.8;
-    this.Qy = 0.8;
-    // Measurement noise baseline (ft²)
-    this.R_base = 1.2;
+    this.Px = 2.0;
+    this.Py = 2.0;
+    // Low process noise when stationary (ft²/s) — prevents position wander
+    this.Qx = 0.08;
+    this.Qy = 0.08;
+    // Measurement noise baseline (ft²) — higher R suppresses raw BLE RSSI jitter
+    this.R_base = 5.0;
   }
 
   /**
    * Time update step (called on calculation interval dt).
-   * Ensures uncertainty grows when no steps/measurements are received so filter never freezes.
+   * Slowly maintains uncertainty floor without creating jitter.
    */
   timeUpdate(dtSeconds = 0.1) {
     const dt = Math.max(0.02, Math.min(0.5, dtSeconds));
     this.Px += this.Qx * dt;
     this.Py += this.Qy * dt;
     // Bound covariance
-    this.Px = Math.min(this.Px, 15.0);
-    this.Py = Math.min(this.Py, 15.0);
+    this.Px = Math.min(this.Px, 6.0);
+    this.Py = Math.min(this.Py, 6.0);
   }
 
   /**
@@ -397,8 +420,9 @@ export class AdaptiveKalman2D {
   predict(dx, dy) {
     this.x  += dx;
     this.y  += dy;
-    this.Px += 1.0;
-    this.Py += 1.0;
+    // PDR motion increases process uncertainty so filter tracks movement immediately
+    this.Px += 1.5;
+    this.Py += 1.5;
     // Clamp to room bounds
     const c = clampToRoom(this.x, this.y);
     this.x = c.x;
@@ -410,24 +434,39 @@ export class AdaptiveKalman2D {
    * bleX/bleY in feet.
    * confidence 0..1
    */
-  update(bleX, bleY, confidence = 0.5) {
+  update(bleX, bleY, confidence = 0.5, isStationary = false) {
     if (bleX === null || bleY === null || isNaN(bleX) || isNaN(bleY)) return;
 
-    // Ensure error covariance never drops to zero
-    this.Px = Math.max(this.Px, 0.4);
-    this.Py = Math.max(this.Py, 0.4);
+    // Minimum covariance floor
+    this.Px = Math.max(this.Px, 0.25);
+    this.Py = Math.max(this.Py, 0.25);
 
-    const conf = Math.max(0.1, Math.min(1.0, confidence));
-    // Measurement noise: higher confidence = smaller R = trust BLE more
-    const R = this.R_base / conf;
+    const conf = Math.max(0.15, Math.min(1.0, confidence));
+    // High measurement noise (R) smooths out high-frequency RSSI jitter
+    let R = this.R_base / conf;
+
+    // When stationary, increase R to lock down micro-fluctuations
+    if (isStationary) {
+      R *= 2.5;
+    }
 
     // Kalman gains
-    const Kx = this.Px / (this.Px + R);
-    const Ky = this.Py / (this.Py + R);
+    let Kx = this.Px / (this.Px + R);
+    let Ky = this.Py / (this.Py + R);
 
-    // Update state estimate
-    this.x += Kx * (bleX - this.x);
-    this.y += Ky * (bleY - this.y);
+    // Deadband threshold: ignore micro-jitters (< 0.25 ft) when stationary
+    const deltaX = bleX - this.x;
+    const deltaY = bleY - this.y;
+    const deltaDist = Math.hypot(deltaX, deltaY);
+
+    if (deltaDist < 0.25 && isStationary) {
+      Kx *= 0.2;
+      Ky *= 0.2;
+    }
+
+    // Update state estimate smoothly
+    this.x += Kx * deltaX;
+    this.y += Ky * deltaY;
 
     // Update error covariance
     this.Px = (1 - Kx) * this.Px;
