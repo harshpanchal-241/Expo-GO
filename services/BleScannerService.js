@@ -1,18 +1,50 @@
 // ============================================================================
-// USER CONFIGURABLE PARAMETERS (Optimized for Ultra-Low Latency & Fast Response)
+// BLE SCANNER & DISTANCE FILTER CONFIGURATION
+// Multi-Stage Processing Pipeline:
+// 1. Outlier Gating: Discards corrupted/unphysical RSSI values outside [-105, -15] dBm.
+// 2. Rolling Median Filter: 5-sample window strips channel-hopping noise (ch 37/38/39).
+// 3. One-Euro Adaptive Low-Pass Filter: Suppresses jitter at rest (0.35 Hz) with 0-lag tracking on movement.
+// 4. Asymmetric dBm EMA: Smooths signal drops (body occlusion) more heavily than signal gains.
+// 5. Log-Distance Path Loss: Converts filtered dBm to physical distance in meters.
+// 6. Kinematic Slew-Rate Limiter: Restricts maximum displacement per tick to human walking speed (~1.6 m/s).
+// 7. Stationary Hysteresis Dead-Zone: Locks distance output when micro-fluctuations occur at rest.
 // ============================================================================
-export const INITIAL_SAMPLE_SIZE = 2;       // Instant fast lock (1-2 packets)
-export const MEDIAN_WINDOW = 3;             // Rolling median filter size
-export const UI_UPDATE_INTERVAL_MS = 50;    // UI refresh rate in ms (20 FPS for silky response)
-export const STATIONARY_STEP_LIMIT = 0.50;  // Max distance change (m) per update when stable
-export const MOVING_STEP_LIMIT = 2.00;      // Max distance change (m) per update when moving
-export const DEAD_ZONE = 0.12;              // Ignore tiny noise fluctuations (m) when stationary
-export const APPROACH_SENSITIVITY = 1.4;    // High-speed reaction multiplier when getting closer
-export const AWAY_SENSITIVITY = 1.2;        // High-speed reaction multiplier when moving away
-export const ONE_EURO_MIN_CUTOFF = 1.2;     // Baseline frequency in Hz (smooth when stationary)
-export const ONE_EURO_BETA = 0.45;          // Responsiveness factor (zero lag when moving)
-export const DEFAULT_TX_POWER = -59;        // Measured RSSI at 1 meter (dBm)
-export const DEFAULT_ENV_N = 2.2;           // Path loss exponent for indoor environment
+
+/** Number of initial packets required before locking initial distance estimate */
+export const INITIAL_SAMPLE_SIZE = 3;
+
+/** Rolling buffer size for median filtering (eliminates advertising channel-hopping spikes) */
+export const MEDIAN_WINDOW = 5;
+
+/** UI & state update interval in milliseconds (50ms = 20 FPS refresh rate) */
+export const UI_UPDATE_INTERVAL_MS = 50;
+
+/** Maximum allowed physical distance change (meters) per 50ms tick when stationary (~1.6 m/s max) */
+export const STATIONARY_STEP_LIMIT = 0.08;
+
+/** Maximum allowed physical distance change (meters) per 50ms tick during active movement */
+export const MOVING_STEP_LIMIT = 0.15;
+
+/** Hysteresis dead-band threshold (meters) to suppress numeric flickering at rest */
+export const DEAD_ZONE = 0.15;
+
+/** Speed reaction multiplier when distance is decreasing (approaching beacon) */
+export const APPROACH_SENSITIVITY = 1.25;
+
+/** Damping multiplier when distance is increasing (guards against human body shadowing dips) */
+export const AWAY_SENSITIVITY = 1.05;
+
+/** One-Euro baseline cutoff frequency (Hz). Lower = smoother at rest (eliminates stationary jitter) */
+export const ONE_EURO_MIN_CUTOFF = 0.35;
+
+/** One-Euro speed responsiveness factor (beta). Higher = faster response to sudden movements */
+export const ONE_EURO_BETA = 0.06;
+
+/** Default measured RSSI at exactly 1 meter distance (dBm) for calibration */
+export const DEFAULT_TX_POWER = -59;
+
+/** Default path loss exponent (n) for indoor multi-path environment (typically 2.0 to 2.8) */
+export const DEFAULT_ENV_N = 2.2;
 // ============================================================================
 
 import { Platform, PermissionsAndroid, Alert, Linking, NativeModules } from "react-native";
@@ -29,6 +61,9 @@ try {
 let bleManagerInstance = null;
 let bleInitError = null;
 
+/**
+ * Checks if native Bluetooth LE scanning is supported in the current runtime.
+ */
 export function isBleSupported() {
   return !!(
     BleManager &&
@@ -36,6 +71,9 @@ export function isBleSupported() {
   );
 }
 
+/**
+ * Retrieves or lazily creates the singleton BleManager instance.
+ */
 export function getBleManager() {
   if (bleInitError) return null;
   if (!bleManagerInstance) {
@@ -56,6 +94,7 @@ export function getBleManager() {
 
 // ============================================================================
 // LOW-PASS & ONE-EURO FILTER IMPLEMENTATION
+// Reference: Casiez et al., "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy Input"
 // ============================================================================
 class LowPassFilter {
   constructor(alpha = 1.0, initVal = 0) {
@@ -83,6 +122,10 @@ class LowPassFilter {
   }
 }
 
+/**
+ * Adaptive One-Euro Filter
+ * Dynamically adjusts cutoff frequency based on input signal rate of change (derivative).
+ */
 export class OneEuroFilter {
   constructor(minCutoff = ONE_EURO_MIN_CUTOFF, beta = ONE_EURO_BETA, dCutoff = 1.0) {
     this.minCutoff = minCutoff;
@@ -129,6 +172,7 @@ export class OneEuroFilter {
 
 // ============================================================================
 // PER-DEVICE FAST & SMOOTH DISTANCE TRACKER
+// Manages the complete signal filtering lifecycle for an individual BLE beacon.
 // ============================================================================
 export class DeviceDistanceTracker {
   constructor(deviceId, txPower = DEFAULT_TX_POWER, envN = DEFAULT_ENV_N) {
@@ -161,15 +205,15 @@ export class DeviceDistanceTracker {
 
   rssiToDistance(rssi) {
     if (!rssi || rssi === 0) return null;
-    const ratio = (this.txPower - rssi) / (10 * this.envN);
+    const ratio = (this.txPower - rssi) / (10 * Math.max(1.0, this.envN));
     return Math.pow(10, ratio);
   }
 
   addPacket(rawRssi, timestamp = Date.now()) {
     if (typeof rawRssi !== "number" || isNaN(rawRssi)) return;
 
-    // Outlier rejection for impossible BLE RSSI values
-    if (rawRssi < -115 || rawRssi > -10) return;
+    // Gated outlier rejection for impossible BLE RSSI values
+    if (rawRssi < -105 || rawRssi > -15) return;
 
     this.rawRssi = rawRssi;
     this.lastPacketTime = timestamp;
@@ -204,32 +248,48 @@ export class DeviceDistanceTracker {
     }
 
     // ------------------------------------------------------------------------
-    // PHASE 2: Tracking Mode (Rolling Median + One-Euro Filter)
+    // PHASE 2: Tracking Mode (Rolling Median + One-Euro Filter + Asymmetric EMA)
     // ------------------------------------------------------------------------
     this.rollingWindow.push(rawRssi);
     if (this.rollingWindow.length > MEDIAN_WINDOW) {
       this.rollingWindow.shift();
     }
 
+    // 1. Median filter to eliminate single-packet spikes & channel-hopping jitter
     const sortedWindow = [...this.rollingWindow].sort((a, b) => a - b);
     const medianWindowRssi = sortedWindow[Math.floor(sortedWindow.length / 2)];
 
-    // Adaptive One-Euro tuning based on current detected trend
+    // 2. Measure local variance to detect stationarity
+    const mean = this.rollingWindow.reduce((acc, v) => acc + v, 0) / this.rollingWindow.length;
+    const variance = this.rollingWindow.reduce((acc, v) => acc + (v - mean) ** 2, 0) / this.rollingWindow.length;
+    const isQuiet = variance < 2.0; // stdDev < 1.4 dBm
+
+    // 3. Adaptive One-Euro tuning based on trend & variance
     let beta = ONE_EURO_BETA;
     let minCutoff = ONE_EURO_MIN_CUTOFF;
 
     if (this.trend === "approaching") {
       beta *= APPROACH_SENSITIVITY;
-      minCutoff *= 1.8; // Open up cutoff frequency for instantaneous approach tracking
+      minCutoff *= 1.4;
     } else if (this.trend === "moving_away") {
       beta *= AWAY_SENSITIVITY;
-      minCutoff *= 1.5;
-    } else {
-      // Stationary: high stability
-      minCutoff *= 0.8;
+      minCutoff *= 1.1;
+    } else if (isQuiet) {
+      // Stationary: clamp low cutoff for zero jitter
+      minCutoff = 0.20;
     }
 
-    this.filteredRssi = this.oneEuro.filter(medianWindowRssi, timestamp, beta, minCutoff);
+    const oneEuroVal = this.oneEuro.filter(medianWindowRssi, timestamp, beta, minCutoff);
+
+    // 4. Asymmetric blending in dBm domain
+    // (Body occlusion causes artificial RSSI drops; filter drops more heavily than signal increases)
+    if (this.filteredRssi === null) {
+      this.filteredRssi = oneEuroVal;
+    } else {
+      const alpha = oneEuroVal > this.filteredRssi ? 0.35 : 0.20;
+      this.filteredRssi = alpha * oneEuroVal + (1.0 - alpha) * this.filteredRssi;
+    }
+
     this.targetDistance = this.rssiToDistance(this.filteredRssi);
 
     // Update movement trend
@@ -239,7 +299,7 @@ export class DeviceDistanceTracker {
   updateTrend(newTargetDist) {
     if (newTargetDist === null) return;
     this.recentDistances.push(newTargetDist);
-    if (this.recentDistances.length > 4) {
+    if (this.recentDistances.length > 5) {
       this.recentDistances.shift();
     }
 
@@ -252,9 +312,9 @@ export class DeviceDistanceTracker {
     const last = this.recentDistances[this.recentDistances.length - 1];
     const diff = last - first;
 
-    if (diff < -0.20) {
+    if (diff < -0.25) {
       this.trend = "approaching";
-    } else if (diff > 0.25) {
+    } else if (diff > 0.30) {
       this.trend = "moving_away";
     } else {
       this.trend = "stationary";
@@ -262,7 +322,7 @@ export class DeviceDistanceTracker {
   }
 
   // --------------------------------------------------------------------------
-  // Dynamic Rate Limiter & Dead Zone Step (Smooth & Zero Lag)
+  // Kinematic Rate Limiter & Hysteresis Dead Zone Step (Smooth & Continuous)
   // --------------------------------------------------------------------------
   stepDistance() {
     if (this.targetDistance === null) return null;
@@ -274,12 +334,12 @@ export class DeviceDistanceTracker {
     const diff = this.targetDistance - this.currentDistance;
     const absDiff = Math.abs(diff);
 
-    // Dead Zone: ignore microscopic noise jitter when stationary
+    // Dead Zone Hysteresis: ignore microscopic noise jitter when stationary
     if (this.trend === "stationary" && absDiff < DEAD_ZONE) {
       return Number(this.currentDistance.toFixed(2));
     }
 
-    // Adaptive step limit based on state
+    // Adaptive step limit (kinematic walking speed limit)
     let stepLimit;
     if (this.trend === "approaching") {
       stepLimit = MOVING_STEP_LIMIT * APPROACH_SENSITIVITY;
@@ -289,8 +349,8 @@ export class DeviceDistanceTracker {
       stepLimit = STATIONARY_STEP_LIMIT;
     }
 
-    // Proportional dynamic step: closes 50% of gap or stepLimit per tick (fast convergence without spikes)
-    const dynamicStep = Math.max(stepLimit, absDiff * 0.50);
+    // Smooth proportional easing with kinematic ceiling
+    const dynamicStep = Math.min(stepLimit, Math.max(0.02, absDiff * 0.30));
     const step = Math.sign(diff) * Math.min(absDiff, dynamicStep);
     this.currentDistance += step;
 

@@ -37,17 +37,17 @@ export function clampToRoom(x, y) {
 
 // ============================================================================
 // RSSI FILTER PIPELINE (per-beacon)
-// Multi-stage filtering: Outlier rejection -> Rolling Median -> One-Euro Filter -> Exponential Moving Average
+// Multi-stage filtering: Outlier rejection -> Rolling Median -> One-Euro Filter -> Asymmetric EMA
 // ============================================================================
 const RSSI_BUFFER_SIZE = 7;      // rolling sample buffer for median
-const RSSI_MIN = -115;           // reject impossible low
-const RSSI_MAX = -10;            // reject impossible high
+const RSSI_MIN = -105;          // reject impossible low
+const RSSI_MAX = -15;           // reject impossible high
 
 export class RssiFilterPipeline {
   constructor() {
     this.buffer          = [];
-    // Ultra-smooth OneEuroFilter: low minCutoff (0.25) eliminates jitter when stationary, beta (0.05) tracks motion
-    this.oneEuro         = new OneEuroFilter(0.25, 0.05);
+    // Ultra-smooth OneEuroFilter: low minCutoff (0.20) eliminates jitter when stationary, beta (0.05) tracks motion
+    this.oneEuro         = new OneEuroFilter(0.20, 0.05);
     this.rawRssi         = null;
     this.filteredRssi    = null;
     this.smoothedDistance= null;
@@ -65,18 +65,21 @@ export class RssiFilterPipeline {
     this.buffer.push(rawRssi);
     if (this.buffer.length > RSSI_BUFFER_SIZE) this.buffer.shift();
 
-    // Median filter to strip impulse spikes
+    // 1. Median filter to strip impulse spikes & channel hopping anomalies
     const sorted = [...this.buffer].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)];
 
-    // One-Euro filter on top of median for sub-dBm smooth progression
+    // 2. One-Euro filter on top of median for sub-dBm smooth progression
     const smoothVal = this.oneEuro.filter(median, timestamp);
     
-    // EMA blending for maximum stability
+    // 3. Asymmetric EMA blending:
+    // When signal weakens (drop in dBm / body blockage), filter more heavily to prevent false jumps.
+    // When signal strengthens (approaching), respond more quickly.
     if (this.filteredRssi === null) {
       this.filteredRssi = smoothVal;
     } else {
-      this.filteredRssi = 0.35 * smoothVal + 0.65 * this.filteredRssi;
+      const alpha = smoothVal > this.filteredRssi ? 0.35 : 0.20;
+      this.filteredRssi = alpha * smoothVal + (1 - alpha) * this.filteredRssi;
     }
 
     return true;
@@ -93,7 +96,7 @@ export class RssiFilterPipeline {
 
   reset() {
     this.buffer          = [];
-    this.oneEuro         = new OneEuroFilter(0.25, 0.05);
+    this.oneEuro         = new OneEuroFilter(0.20, 0.05);
     this.rawRssi         = null;
     this.filteredRssi    = null;
     this.smoothedDistance= null;
@@ -121,7 +124,7 @@ export class RssiFilterPipeline {
 }
 
 // ============================================================================
-// RSSI → DISTANCE  (smooth path-loss model, returns feet)
+// RSSI → DISTANCE  (smooth path-loss model with kinematic limits, returns feet)
 // ============================================================================
 export function rssiToDistance(filteredRssi, txPower, n, prevDistFt = null) {
   if (filteredRssi === null || filteredRssi === 0 || isNaN(filteredRssi)) return null;
@@ -130,12 +133,18 @@ export function rssiToDistance(filteredRssi, txPower, n, prevDistFt = null) {
   const rawFeet  = meters * 3.28084;
   if (!isFinite(rawFeet) || rawFeet < 0) return null;
 
-  // If previous distance exists, smoothly blend to eliminate step transitions
+  // If previous distance exists, apply kinematic rate-limiting and smooth blending
   if (prevDistFt !== null && prevDistFt > 0) {
-    // Adaptive smoothing factor: small changes smoothed heavily, large changes track quickly
-    const diff = Math.abs(rawFeet - prevDistFt);
-    const alpha = diff > 4.0 ? 0.40 : diff > 1.5 ? 0.25 : 0.15;
-    return Number((alpha * rawFeet + (1 - alpha) * prevDistFt).toFixed(2));
+    const diff = rawFeet - prevDistFt;
+    const absDiff = Math.abs(diff);
+
+    // Max plausible walking displacement in a 100ms cycle (~0.6 ft per tick = ~6 ft/s)
+    const maxChangePerTick = 0.60;
+    const clampedFeet = prevDistFt + Math.sign(diff) * Math.min(absDiff, maxChangePerTick);
+
+    // Progressive easing
+    const alpha = absDiff > 2.0 ? 0.30 : 0.18;
+    return Number((alpha * clampedFeet + (1 - alpha) * prevDistFt).toFixed(2));
   }
 
   return Number(rawFeet.toFixed(2));
@@ -339,28 +348,27 @@ export function solveTwoBeaconPosition(b1, b2, d1, d2, w1, w2, prevX = 9, prevY 
     }
   }
 
-  // Fine-tune around candidate with localized least-squares search
-  let bestX = candidateX;
-  let bestY = candidateY;
-  let bestErr = Infinity;
-  const searchRange = 2.0; // 2 ft around analytical solution
-  const step = 0.2;        // 0.2 ft precision
-
-  for (let x = Math.max(0, candidateX - searchRange); x <= Math.min(ROOM_WIDTH_FT, candidateX + searchRange); x += step) {
-    for (let y = Math.max(0, candidateY - searchRange); y <= Math.min(ROOM_HEIGHT_FT, candidateY + searchRange); y += step) {
-      const dist1 = Math.hypot(x - b1.x, y - b1.y);
-      const dist2 = Math.hypot(x - b2.x, y - b2.y);
-      const err = safeW1 * (dist1 - d1) ** 2 + safeW2 * (dist2 - d2) ** 2;
-      if (err < bestErr) {
-        bestErr = err;
-        bestX = x;
-        bestY = y;
-      }
+  // Continuous weighted refinement: if beacon weights differ, shift smoothly toward more confident circle
+  if (totalW > 0 && Math.abs(safeW1 - safeW2) > 0.10) {
+    const wRatio = safeW1 / totalW;
+    const curD1 = Math.hypot(candidateX - b1.x, candidateY - b1.y);
+    const curD2 = Math.hypot(candidateX - b2.x, candidateY - b2.y);
+    const res1 = d1 - curD1;
+    const res2 = d2 - curD2;
+    if (curD1 > 0.1 && curD2 > 0.1) {
+      const u1x = (candidateX - b1.x) / curD1;
+      const u1y = (candidateY - b1.y) / curD1;
+      const u2x = (candidateX - b2.x) / curD2;
+      const u2y = (candidateY - b2.y) / curD2;
+      candidateX += 0.20 * (wRatio * res1 * u1x + (1 - wRatio) * res2 * u2x);
+      candidateY += 0.20 * (wRatio * res1 * u1y + (1 - wRatio) * res2 * u2y);
     }
   }
 
-  const clamped = clampToRoom(bestX, bestY);
-  const totalErr = isFinite(bestErr) ? Math.sqrt(bestErr / (safeW1 + safeW2)) : 5;
+  const clamped = clampToRoom(candidateX, candidateY);
+  const curD1 = Math.hypot(clamped.x - b1.x, clamped.y - b1.y);
+  const curD2 = Math.hypot(clamped.x - b2.x, clamped.y - b2.y);
+  const totalErr = Math.sqrt((safeW1 * (curD1 - d1) ** 2 + safeW2 * (curD2 - d2) ** 2) / Math.max(0.01, totalW));
   const confidence = Math.max(0.2, Math.min(1.0, 1 - totalErr / 12));
 
   return { x: clamped.x, y: clamped.y, confidence };
@@ -393,11 +401,11 @@ export class AdaptiveKalman2D {
     // Error covariance
     this.Px = 2.0;
     this.Py = 2.0;
-    // Low process noise when stationary (ft²/s) — prevents position wander
-    this.Qx = 0.08;
-    this.Qy = 0.08;
-    // Measurement noise baseline (ft²) — higher R suppresses raw BLE RSSI jitter
-    this.R_base = 5.0;
+    // Process noise when stationary (ft²/s) — prevents position wander while maintaining responsiveness
+    this.Qx = 0.12;
+    this.Qy = 0.12;
+    // Measurement noise baseline (ft²)
+    this.R_base = 4.0;
   }
 
   /**
@@ -438,30 +446,29 @@ export class AdaptiveKalman2D {
     if (bleX === null || bleY === null || isNaN(bleX) || isNaN(bleY)) return;
 
     // Minimum covariance floor
-    this.Px = Math.max(this.Px, 0.25);
-    this.Py = Math.max(this.Py, 0.25);
+    this.Px = Math.max(this.Px, 0.30);
+    this.Py = Math.max(this.Py, 0.30);
 
     const conf = Math.max(0.15, Math.min(1.0, confidence));
-    // High measurement noise (R) smooths out high-frequency RSSI jitter
     let R = this.R_base / conf;
 
-    // When stationary, increase R to lock down micro-fluctuations
+    // When stationary, moderately increase R to smooth micro-fluctuations without freezing
     if (isStationary) {
-      R *= 2.5;
+      R *= 1.8;
     }
 
     // Kalman gains
     let Kx = this.Px / (this.Px + R);
     let Ky = this.Py / (this.Py + R);
 
-    // Deadband threshold: ignore micro-jitters (< 0.25 ft) when stationary
+    // Deadband threshold: ignore microscopic noise (< 0.15 ft) when stationary
     const deltaX = bleX - this.x;
     const deltaY = bleY - this.y;
     const deltaDist = Math.hypot(deltaX, deltaY);
 
-    if (deltaDist < 0.25 && isStationary) {
-      Kx *= 0.2;
-      Ky *= 0.2;
+    if (deltaDist < 0.15 && isStationary) {
+      Kx *= 0.35;
+      Ky *= 0.35;
     }
 
     // Update state estimate smoothly

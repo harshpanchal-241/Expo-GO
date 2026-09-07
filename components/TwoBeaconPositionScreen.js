@@ -37,13 +37,16 @@ const STAGES = [
   { id: "position",  label: "4. Position\nTest"   },
 ];
 
-export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
+export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 0 }) {
   // ─── Config state (persisted) ─────────────────────────────────────────────
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [configLoaded, setConfigLoaded] = useState(false);
 
   // ─── Current UI stage ─────────────────────────────────────────────────────
   const [activeStage, setActiveStage] = useState("select");
+
+  // ─── Drag state to lock scroll during beacon placement ────────────────────
+  const [isDraggingMap, setIsDraggingMap] = useState(false);
 
   // ─── Debug overlays ───────────────────────────────────────────────────────
   const [showOverlays, setShowOverlays] = useState(false);
@@ -57,8 +60,10 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
     positionState,
     trail,
     debugInfo,
+    positioningMode,
+    groundTruth,
     actions,
-  } = useTwoBeaconPositioning({ config, pdrStepCallbackRef });
+  } = useTwoBeaconPositioning({ config, pdrStepCallbackRef, heading });
 
   // ─── Load config on mount ─────────────────────────────────────────────────
   useEffect(() => {
@@ -79,10 +84,13 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
 
 
   // ─── Config update helper ─────────────────────────────────────────────────
-  const updateConfig = useCallback(async (updates) => {
+  // When persist=false (during active pan gesture), update state only without async storage blocking
+  const updateConfig = useCallback(async (updates, persist = true) => {
     setConfig(prev => {
       const next = { ...prev, ...updates };
-      saveBeaconConfig(updates); // fire-and-forget
+      if (persist) {
+        saveBeaconConfig(updates);
+      }
       return next;
     });
   }, []);
@@ -139,7 +147,7 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
   }
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
+    <ScrollView contentContainerStyle={styles.container} scrollEnabled={!isDraggingMap}>
       {/* ── Header ── */}
       <View style={styles.header}>
         <View>
@@ -181,12 +189,16 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
       {activeStage === "place" && (
         <PlaceBeaconsStage
           config={config}
-          onBeacon1Move={(x, y) => updateConfig({ beacon1X: x, beacon1Y: y })}
-          onBeacon2Move={(x, y) => updateConfig({ beacon2X: x, beacon2Y: y })}
-          onResetLayout={() => updateConfig({ beacon1X: 0, beacon1Y: 15, beacon2X: 18, beacon2Y: 15 })}
+          onBeacon1Move={(x, y) => updateConfig({ beacon1X: x, beacon1Y: y }, false)}
+          onBeacon1Commit={(x, y) => updateConfig({ beacon1X: x, beacon1Y: y }, true)}
+          onBeacon2Move={(x, y) => updateConfig({ beacon2X: x, beacon2Y: y }, false)}
+          onBeacon2Commit={(x, y) => updateConfig({ beacon2X: x, beacon2Y: y }, true)}
+          onApplyPreset={(p) => updateConfig(p, true)}
+          onDragStateChange={setIsDraggingMap}
+          onResetLayout={() => updateConfig({ beacon1X: 0, beacon1Y: 15, beacon2X: 18, beacon2Y: 15 }, true)}
           heightCorrectionOn={config.heightCorrectionOn}
-          onToggleHeight={(v) => updateConfig({ heightCorrectionOn: v })}
-          onUpdateHeight={(key, v) => updateConfig({ [key]: parseFloat(v) || 0 })}
+          onToggleHeight={(v) => updateConfig({ heightCorrectionOn: v }, true)}
+          onUpdateHeight={(key, v) => updateConfig({ [key]: parseFloat(v) || 0 }, true)}
           onAdvance={() => setActiveStage("calibrate")}
         />
       )}
@@ -199,9 +211,9 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
           config={config}
           actions={actions}
           isScanning={isScanning}
-          onSaveB1TxPower={(v) => updateConfig({ beacon1TxPower: v })}
-          onSaveB2TxPower={(v) => updateConfig({ beacon2TxPower: v })}
-          onSavePathLossN={(v) => updateConfig({ pathLossN: v })}
+          onSaveB1TxPower={(v) => updateConfig({ beacon1TxPower: v }, true)}
+          onSaveB2TxPower={(v) => updateConfig({ beacon2TxPower: v }, true)}
+          onSavePathLossN={(v) => updateConfig({ pathLossN: v }, true)}
           onAdvance={() => setActiveStage("position")}
         />
       )}
@@ -216,6 +228,7 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef }) {
           moduleState={moduleState}
           positionState={positionState}
           trail={trail}
+          heading={heading}
           debugInfo={debugInfo}
           showOverlays={showOverlays}
           onToggleOverlays={() => setShowOverlays(v => !v)}
@@ -409,11 +422,22 @@ function Tag({ label, color }) {
 }
 
 // ============================================================================
+// ============================================================================
 // Stage 2 — Place Beacons
 // ============================================================================
 function PlaceBeaconsStage({
-  config, onBeacon1Move, onBeacon2Move, onResetLayout,
-  heightCorrectionOn, onToggleHeight, onUpdateHeight, onAdvance,
+  config,
+  onBeacon1Move,
+  onBeacon1Commit,
+  onBeacon2Move,
+  onBeacon2Commit,
+  onApplyPreset,
+  onDragStateChange,
+  onResetLayout,
+  heightCorrectionOn,
+  onToggleHeight,
+  onUpdateHeight,
+  onAdvance,
 }) {
   return (
     <>
@@ -421,10 +445,43 @@ function PlaceBeaconsStage({
         <View style={styles.cardTitleRow}>
           <Text style={styles.cardTitle}>Beacon Placement</Text>
           <Pressable style={styles.resetLayoutBtn} onPress={onResetLayout}>
-            <Text style={styles.resetLayoutText}>Reset Layout</Text>
+            <Text style={styles.resetLayoutText}>Reset</Text>
           </Pressable>
         </View>
-        <Text style={styles.cardSub}>Drag B1 and B2 to their physical locations in the room.</Text>
+        <Text style={styles.cardSub}>
+          Drag B1 and B2 directly on the map, use Room Presets, or nudge with +/- steppers below.
+        </Text>
+
+        {/* Room Presets */}
+        <Text style={[styles.cardTitle, { fontSize: 12, marginTop: 4, marginBottom: 6 }]}>
+          Room Layout Presets
+        </Text>
+        <View style={styles.presetRow}>
+          <PresetChip
+            label="Top Wall (Standard)"
+            sub="B1: (0, 15)  •  B2: (18, 15)"
+            active={config.beacon1X === 0 && config.beacon1Y === 15 && config.beacon2X === 18 && config.beacon2Y === 15}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 15, beacon2X: 18, beacon2Y: 15 })}
+          />
+          <PresetChip
+            label="Diagonal Corners"
+            sub="B1: (0, 0)  •  B2: (18, 15)"
+            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === 18 && config.beacon2Y === 15}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: 18, beacon2Y: 15 })}
+          />
+          <PresetChip
+            label="Side Wall Centers"
+            sub="B1: (0, 7.5)  •  B2: (18, 7.5)"
+            active={config.beacon1X === 0 && config.beacon1Y === 7.5 && config.beacon2X === 18 && config.beacon2Y === 7.5}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 7.5, beacon2X: 18, beacon2Y: 7.5 })}
+          />
+          <PresetChip
+            label="Front Wall"
+            sub="B1: (0, 0)  •  B2: (18, 0)"
+            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === 18 && config.beacon2Y === 0}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: 18, beacon2Y: 0 })}
+          />
+        </View>
       </View>
 
       <TestAreaMap
@@ -434,13 +491,57 @@ function PlaceBeaconsStage({
         isSetupMode={true}
         showDebugOverlays={false}
         onBeacon1Move={onBeacon1Move}
+        onBeacon1Commit={onBeacon1Commit}
         onBeacon2Move={onBeacon2Move}
+        onBeacon2Commit={onBeacon2Commit}
+        onDragStateChange={onDragStateChange}
       />
 
-      {/* Coordinate display */}
+      {/* Coordinate Steppers for Sub-Inch Fine Tuning */}
       <View style={styles.coordCard}>
-        <CoordRow label="Beacon 1" x={config.beacon1X} y={config.beacon1Y} color="#0369a1" />
-        <CoordRow label="Beacon 2" x={config.beacon2X} y={config.beacon2Y} color="#6d28d9" />
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <Text style={[styles.cardTitle, { color: "#0369a1", marginBottom: 0 }]}>Beacon 1 (B1)</Text>
+          <Text style={styles.coordHeaderSub}>
+            X: {config.beacon1X.toFixed(2)} ft  •  Y: {config.beacon1Y.toFixed(2)} ft
+          </Text>
+        </View>
+        <CoordStepper
+          axis="X"
+          value={config.beacon1X}
+          max={18}
+          color="#0369a1"
+          onChange={(v) => onBeacon1Commit(v, config.beacon1Y)}
+        />
+        <CoordStepper
+          axis="Y"
+          value={config.beacon1Y}
+          max={15}
+          color="#0369a1"
+          onChange={(v) => onBeacon1Commit(config.beacon1X, v)}
+        />
+
+        <View style={{ height: 1, backgroundColor: "#e2e8f0", marginVertical: 10 }} />
+
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <Text style={[styles.cardTitle, { color: "#6d28d9", marginBottom: 0 }]}>Beacon 2 (B2)</Text>
+          <Text style={styles.coordHeaderSub}>
+            X: {config.beacon2X.toFixed(2)} ft  •  Y: {config.beacon2Y.toFixed(2)} ft
+          </Text>
+        </View>
+        <CoordStepper
+          axis="X"
+          value={config.beacon2X}
+          max={18}
+          color="#6d28d9"
+          onChange={(v) => onBeacon2Commit(v, config.beacon2Y)}
+        />
+        <CoordStepper
+          axis="Y"
+          value={config.beacon2Y}
+          max={15}
+          color="#6d28d9"
+          onChange={(v) => onBeacon2Commit(config.beacon2X, v)}
+        />
       </View>
 
       {/* Height correction */}
@@ -456,7 +557,7 @@ function PlaceBeaconsStage({
         </View>
         {heightCorrectionOn && (
           <>
-            <Text style={styles.cardSub}>For ceiling-mounted beacons.</Text>
+            <Text style={styles.cardSub}>For ceiling or wall-mounted beacons.</Text>
             <HeightInput label="Beacon 1 Height (ft)" value={config.beacon1HeightFt}
               onChange={v => onUpdateHeight("beacon1HeightFt", v)} />
             <HeightInput label="Beacon 2 Height (ft)" value={config.beacon2HeightFt}
@@ -474,11 +575,46 @@ function PlaceBeaconsStage({
   );
 }
 
-function CoordRow({ label, x, y, color }) {
+function PresetChip({ label, sub, active, onPress }) {
   return (
-    <View style={styles.coordRow}>
-      <Text style={[styles.coordLabel, { color }]}>{label}</Text>
-      <Text style={styles.coordValue}>X: {x.toFixed(2)} ft  •  Y: {y.toFixed(2)} ft</Text>
+    <Pressable
+      style={[styles.presetChip, active && styles.presetChipActive]}
+      onPress={onPress}
+    >
+      <Text style={[styles.presetChipText, active && styles.presetChipTextActive]}>{label}</Text>
+      <Text style={[styles.presetChipSub, active && styles.presetChipSubActive]}>{sub}</Text>
+    </Pressable>
+  );
+}
+
+function CoordStepper({ axis, value, max, color, onChange }) {
+  const numVal = Number(value.toFixed(2));
+  return (
+    <View style={styles.stepperRow}>
+      <Text style={[styles.stepperAxis, { color }]}>{axis}:</Text>
+      <Pressable
+        style={styles.stepperBtn}
+        onPress={() => onChange(Math.max(0, Number((numVal - 0.5).toFixed(2))))}
+      >
+        <Text style={styles.stepperBtnText}>−</Text>
+      </Pressable>
+      <TextInput
+        style={styles.stepperInput}
+        value={String(numVal)}
+        keyboardType="numeric"
+        returnKeyType="done"
+        onSubmitEditing={(e) => {
+          const parsed = parseFloat(e.nativeEvent.text);
+          if (isFinite(parsed)) onChange(Math.max(0, Math.min(max, parsed)));
+        }}
+      />
+      <Text style={styles.stepperUnit}>ft</Text>
+      <Pressable
+        style={styles.stepperBtn}
+        onPress={() => onChange(Math.min(max, Number((numVal + 0.5).toFixed(2))))}
+      >
+        <Text style={styles.stepperBtnText}>+</Text>
+      </Pressable>
     </View>
   );
 }
@@ -557,19 +693,22 @@ function CalibrateStage({
 // Stage 4 — Position Test
 // ============================================================================
 function PositionTestStage({
-  config, moduleState, positionState, trail, debugInfo,
+  config, moduleState, positionState, trail, heading, debugInfo,
   showOverlays, onToggleOverlays, actions, onGoToPlace,
 }) {
   const isPositioning = moduleState === "POSITIONING";
   const isPaused      = moduleState === "PAUSED";
-  const isStopped     = !isPositioning && !isPaused;  // everything else = show Start button
-
+  const isStopped     = !isPositioning && !isPaused;
 
   const { bleX = 9, bleY = 7.5, pdrX = 9, pdrY = 7.5,
-          fusedX = 9, fusedY = 7.5, confidence = 0 } = positionState || {};
+          fusedX = 9, fusedY = 7.5, activeX = 9, activeY = 7.5, confidence = 0 } = positionState || {};
 
   const b1Available = debugInfo?.b1Available;
   const b2Available = debugInfo?.b2Available;
+  const mode = debugInfo?.positioningMode || "fused";
+  const gt = debugInfo?.groundTruth;
+  const gtError = debugInfo?.gtErrorFt;
+  const accScore = debugInfo?.accuracyScore;
 
   return (
     <>
@@ -598,12 +737,77 @@ function PositionTestStage({
         </View>
       </View>
 
+      {/* Positioning Mode Switcher */}
+      <View style={styles.modeContainer}>
+        <Pressable
+          style={[styles.modeTab, mode === "fused" && styles.modeTabActive]}
+          onPress={() => actions.setPositioningMode?.("fused")}
+        >
+          <Text style={[styles.modeTabText, mode === "fused" && styles.modeTabTextActive]}>
+            🛰️ Fused (BLE+PDR)
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.modeTab, mode === "ble" && styles.modeTabActive]}
+          onPress={() => actions.setPositioningMode?.("ble")}
+        >
+          <Text style={[styles.modeTabText, mode === "ble" && styles.modeTabTextActive]}>
+            📶 BLE Only
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.modeTab, mode === "pdr" && styles.modeTabActive]}
+          onPress={() => actions.setPositioningMode?.("pdr")}
+        >
+          <Text style={[styles.modeTabText, mode === "pdr" && styles.modeTabTextActive]}>
+            🚶 PDR Only
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Interactive Ground Truth Accuracy Card */}
+      {gt && (
+        <View style={styles.gtCard}>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <View style={styles.gtDot} />
+              <Text style={styles.gtTitle}>Ground Truth Benchmark</Text>
+            </View>
+            <Pressable onPress={() => actions.setGroundTruth?.(null)} style={styles.gtClearBtn}>
+              <Text style={styles.gtClearText}>Clear Target</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.gtStatsRow}>
+            <View style={styles.gtStatItem}>
+              <Text style={styles.gtStatLabel}>Target Point</Text>
+              <Text style={styles.gtStatVal}>({gt.x.toFixed(1)}, {gt.y.toFixed(1)}) ft</Text>
+            </View>
+            <View style={styles.gtStatItem}>
+              <Text style={styles.gtStatLabel}>Distance Error</Text>
+              <Text style={[styles.gtStatVal, { color: gtError < 2.0 ? "#16a34a" : gtError < 4.0 ? "#d97706" : "#dc2626" }]}>
+                {gtError != null ? `${gtError.toFixed(2)} ft` : "--"}
+              </Text>
+              {gtError != null && <Text style={styles.gtStatSub}>({(gtError / 3.28084).toFixed(2)} m)</Text>}
+            </View>
+            <View style={styles.gtStatItem}>
+              <Text style={styles.gtStatLabel}>Accuracy Score</Text>
+              <Text style={[styles.gtStatVal, { color: accScore > 80 ? "#16a34a" : accScore > 60 ? "#d97706" : "#dc2626" }]}>
+                {accScore != null ? `${accScore}%` : "--"}
+              </Text>
+            </View>
+          </View>
+        </View>
+      )}
+
       {/* Live position metrics */}
       <View style={styles.metricsRow}>
-        <MetricTile label="X (Width)" value={`${fusedX.toFixed(2)} ft`} highlight sub={`${(fusedX / 3.28084).toFixed(2)} m`} />
-        <MetricTile label="Y (Length)" value={`${fusedY.toFixed(2)} ft`} highlight sub={`${(fusedY / 3.28084).toFixed(2)} m`} />
+        <MetricTile label="X Position" value={`${activeX.toFixed(2)} ft`} highlight sub={`${(activeX / 3.28084).toFixed(2)} m`} />
+        <MetricTile label="Y Position" value={`${activeY.toFixed(2)} ft`} highlight sub={`${(activeY / 3.28084).toFixed(2)} m`} />
         <MetricTile label="Confidence" value={`${(confidence * 100).toFixed(0)}%`}
-          color={confidence > 0.6 ? "#1a7f37" : confidence > 0.3 ? "#d29922" : "#cf222e"} />
+          color={confidence > 0.6 ? "#1a7f37" : confidence > 0.3 ? "#d29922" : "#cf222e"}
+          sub={debugInfo?.isStationary ? "Stationary" : "Active Motion"}
+        />
       </View>
 
       {/* Beacon Distances Row */}
@@ -628,14 +832,19 @@ function PositionTestStage({
         beacon2={{ x: config.beacon2X, y: config.beacon2Y }}
         beacon1Dist={debugInfo?.b1?.distanceFt}
         beacon2Dist={debugInfo?.b2?.distanceFt}
-        userPosition={{ fusedX, fusedY }}
+        userPosition={{ fusedX, fusedY, activeX, activeY }}
         blePosition={showOverlays ? { bleX, bleY } : null}
         pdrPosition={showOverlays ? { pdrX, pdrY } : null}
         trail={trail}
+        heading={heading}
+        groundTruth={gt}
         isSetupMode={false}
         showDebugOverlays={showOverlays}
         onBeacon1Move={() => {}}
+        onBeacon1Commit={() => {}}
         onBeacon2Move={() => {}}
+        onBeacon2Commit={() => {}}
+        onMapTap={(x, y) => actions.setGroundTruth?.({ x, y })}
       />
 
       {/* Control buttons */}
@@ -662,10 +871,14 @@ function PositionTestStage({
       <View style={styles.controlRow}>
         <ActionBtn
           label="👣 Add Step (+2.3 ft)"
-          onPress={() => actions.addManualStep?.(2.3, 0)}
+          onPress={() => actions.addManualStep?.(2.3, heading)}
           style={[styles.btnOutline, { borderColor: "#1f6feb", backgroundColor: "#f0f8ff" }]}
         />
-        <ActionBtn label="↺ Reset Pos" onPress={() => { actions.resetPosition?.(); actions.resetPipelines?.(); }} style={styles.btnOutline} />
+        <ActionBtn
+          label="↺ Reset to Center"
+          onPress={() => { actions.resetPosition?.(9, 7.5); actions.resetPipelines?.(); }}
+          style={styles.btnOutline}
+        />
         <ActionBtn label="✕ Clear Trail" onPress={actions.clearTrail} style={styles.btnOutline} />
       </View>
 
@@ -755,6 +968,27 @@ const styles = StyleSheet.create({
   cardTitleRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 },
   cardSub:      { fontSize: 11, color: "#57606a", lineHeight: 16, marginBottom: 8 },
 
+  // Presets
+  presetRow: { flexDirection: "row", gap: 6, flexWrap: "wrap", marginTop: 4, marginBottom: 4 },
+  presetChip: { flex: 1, minWidth: "46%", paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8,
+                borderWidth: 1, borderColor: "#cbd5e1", backgroundColor: "#f8fafc" },
+  presetChipActive: { borderColor: "#2563eb", backgroundColor: "#eff6ff" },
+  presetChipText: { fontSize: 11, fontWeight: "700", color: "#334155" },
+  presetChipTextActive: { color: "#1d4ed8" },
+  presetChipSub: { fontSize: 9.5, color: "#64748b", marginTop: 1 },
+  presetChipSubActive: { color: "#2563eb" },
+
+  // Steppers
+  stepperRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 },
+  stepperAxis: { width: 20, fontSize: 13, fontWeight: "800" },
+  stepperBtn: { width: 34, height: 34, borderRadius: 8, backgroundColor: "#f1f5f9", borderWidth: 1,
+                borderColor: "#cbd5e1", justifyContent: "center", alignItems: "center" },
+  stepperBtnText: { fontSize: 18, fontWeight: "800", color: "#1e293b", lineHeight: 20 },
+  stepperInput: { width: 72, height: 34, borderWidth: 1, borderColor: "#cbd5e1", borderRadius: 8,
+                  backgroundColor: "#fff", textAlign: "center", fontSize: 13, fontWeight: "700", color: "#1e293b" },
+  stepperUnit: { fontSize: 11, color: "#64748b", fontWeight: "600", width: 14 },
+  coordHeaderSub: { fontSize: 11, color: "#64748b", fontFamily: "monospace" },
+
   // Selected beacons
   selRow:     { flexDirection: "row", alignItems: "center", gap: 8,
                 borderWidth: 1, borderRadius: 8, padding: 8, marginBottom: 6 },
@@ -805,16 +1039,31 @@ const styles = StyleSheet.create({
   resetLayoutText: { fontSize: 11, fontWeight: "700", color: "#57606a" },
   coordCard:  { backgroundColor: "#fff", borderRadius: 10, padding: 12,
                 borderWidth: 1, borderColor: "#d0d7de", marginBottom: 10 },
-  coordRow:   { flexDirection: "row", justifyContent: "space-between",
-                alignItems: "center", paddingVertical: 5 },
-  coordLabel: { fontWeight: "700", fontSize: 12 },
-  coordValue: { fontSize: 12, color: "#24292f", fontFamily: "monospace" },
   heightRow:  { flexDirection: "row", justifyContent: "space-between",
                 alignItems: "center", marginTop: 8 },
   heightLabel:{ fontSize: 12, color: "#57606a", fontWeight: "600" },
   heightInput:{ borderWidth: 1, borderColor: "#d0d7de", borderRadius: 8,
                 paddingHorizontal: 10, paddingVertical: 6, fontSize: 13, fontWeight: "700",
                 backgroundColor: "#f6f8fa", width: 80, textAlign: "right", color: "#24292f" },
+
+  // Mode switcher
+  modeContainer: { flexDirection: "row", backgroundColor: "#f1f5f9", borderRadius: 10, padding: 3, marginBottom: 10 },
+  modeTab: { flex: 1, paddingVertical: 8, alignItems: "center", borderRadius: 8 },
+  modeTabActive: { backgroundColor: "#fff", shadowColor: "#000", shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 },
+  modeTabText: { fontSize: 11, fontWeight: "600", color: "#64748b" },
+  modeTabTextActive: { color: "#1d4ed8", fontWeight: "800" },
+
+  // Ground truth accuracy card
+  gtCard: { backgroundColor: "#fff1f2", borderRadius: 10, padding: 10, borderWidth: 1, borderColor: "#fecdd3", marginBottom: 10 },
+  gtDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#e11d48" },
+  gtTitle: { fontSize: 12, fontWeight: "800", color: "#be123c" },
+  gtClearBtn: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, backgroundColor: "#fff", borderWidth: 1, borderColor: "#fda4af" },
+  gtClearText: { fontSize: 10, fontWeight: "700", color: "#e11d48" },
+  gtStatsRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 8 },
+  gtStatItem: { flex: 1, alignItems: "center" },
+  gtStatLabel: { fontSize: 10, color: "#9f1239", fontWeight: "600" },
+  gtStatVal: { fontSize: 14, fontWeight: "800", color: "#881337", marginTop: 2 },
+  gtStatSub: { fontSize: 9.5, color: "#be123c", fontWeight: "600" },
 
   // Position test stage
   statusBanner: { flexDirection: "row", alignItems: "center", gap: 8,

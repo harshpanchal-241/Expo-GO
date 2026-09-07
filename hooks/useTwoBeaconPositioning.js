@@ -33,6 +33,7 @@ const MAX_TRAIL_POINTS = 60;
 export function useTwoBeaconPositioning({
   config,              // beaconConfig from storage
   pdrStepCallbackRef,  // parent fills this ref; hook attaches to it
+  heading = 0,         // compass/gyro heading from parent
 }) {
   // ─── Scan state ────────────────────────────────────────────────────────────
   const [isScanning,       setIsScanning]       = useState(false);
@@ -44,11 +45,16 @@ export function useTwoBeaconPositioning({
   // CALIBRATED | POSITIONING | PAUSED | STOPPED
   const [moduleState, setModuleState] = useState("IDLE");
 
+  // ─── Positioning mode & Ground truth validation ────────────────────────────
+  const [positioningMode, setPositioningMode] = useState("fused"); // "fused" | "ble" | "pdr"
+  const [groundTruth,     setGroundTruth]     = useState(null);    // { x, y } in feet
+
   // ─── Position output (for UI renders) ─────────────────────────────────────
   const [positionState, setPositionState] = useState({
     bleX: 9, bleY: 7.5,
     pdrX: 9, pdrY: 7.5,
     fusedX: 9, fusedY: 7.5,
+    activeX: 9, activeY: 7.5,
     confidence: 0,
     timestamp: Date.now(),
   });
@@ -56,11 +62,18 @@ export function useTwoBeaconPositioning({
   const [debugInfo,  setDebugInfo]  = useState({});
 
   // ─── Internal refs (fast, no re-render) ───────────────────────────────────
-  const isScanningRef    = useRef(false);
-  const modulStateRef    = useRef("IDLE");
-  const managerRef       = useRef(null);
-  const calcIntervalRef  = useRef(null);
-  const uiIntervalRef    = useRef(null);
+  const isScanningRef        = useRef(false);
+  const modulStateRef        = useRef("IDLE");
+  const managerRef           = useRef(null);
+  const calcIntervalRef      = useRef(null);
+  const uiIntervalRef        = useRef(null);
+  const positioningModeRef   = useRef("fused");
+  const groundTruthRef       = useRef(null);
+  const headingRef           = useRef(heading);
+
+  useEffect(() => { positioningModeRef.current = positioningMode; }, [positioningMode]);
+  useEffect(() => { groundTruthRef.current = groundTruth; }, [groundTruth]);
+  useEffect(() => { headingRef.current = heading; }, [heading]);
 
   // Per-beacon RSSI pipelines
   const pipeline1Ref = useRef(new RssiFilterPipeline());
@@ -85,7 +98,7 @@ export function useTwoBeaconPositioning({
   const deviceMetaRef = useRef({});
 
   // Latest position ref (used by UI loop to avoid stale state)
-  const positionRef   = useRef({ bleX: 9, bleY: 7.5, pdrX: 9, pdrY: 7.5, fusedX: 9, fusedY: 7.5, confidence: 0 });
+  const positionRef   = useRef({ bleX: 9, bleY: 7.5, pdrX: 9, pdrY: 7.5, fusedX: 9, fusedY: 7.5, activeX: 9, activeY: 7.5, confidence: 0 });
   const trailRef      = useRef([]);
   const debugRef      = useRef({});
 
@@ -243,9 +256,6 @@ export function useTwoBeaconPositioning({
     const dtSeconds = Math.max(0.05, Math.min(1.0, (now - lastCalcTime.current) / 1000));
     lastCalcTime.current = now;
 
-    // Check if device is stationary (no PDR steps in last 1.5s)
-    const isStationary = (now - lastStepTimeRef.current) > 1500;
-
     // Get pipeline states
     const s1 = pipeline1Ref.current.getState();
     const s2 = pipeline2Ref.current.getState();
@@ -253,6 +263,15 @@ export function useTwoBeaconPositioning({
     // Distances with adaptive smoothing (feet)
     let d1 = rssiToDistance(s1.filteredRssi, cfg.beacon1TxPower, cfg.pathLossN, prevDist1Ref.current);
     let d2 = rssiToDistance(s2.filteredRssi, cfg.beacon2TxPower, cfg.pathLossN, prevDist2Ref.current);
+
+    // Dual Motion Detection:
+    // User is moving if PDR step occurred within 2.0s OR if BLE distances shift by > 0.30 ft
+    const pdrMoving = (now - lastStepTimeRef.current) < 2000;
+    const bleMoving = (
+      (prevDist1Ref.current !== null && d1 !== null && Math.abs(d1 - prevDist1Ref.current) > 0.30) ||
+      (prevDist2Ref.current !== null && d2 !== null && Math.abs(d2 - prevDist2Ref.current) > 0.30)
+    );
+    const isStationary = !pdrMoving && !bleMoving;
 
     // Height correction
     let hv1 = 1, hv2 = 1;
@@ -322,16 +341,37 @@ export function useTwoBeaconPositioning({
 
     // Display-level EMA smoother to eliminate high-frequency micro-jitter
     const prevDisplay = displayPosRef.current || rawFused;
-    const alpha = isStationary ? 0.15 : 0.35;
+    const alpha = isStationary ? 0.20 : 0.40;
     const smoothX = Number((alpha * rawFused.x + (1 - alpha) * prevDisplay.x).toFixed(2));
     const smoothY = Number((alpha * rawFused.y + (1 - alpha) * prevDisplay.y).toFixed(2));
     displayPosRef.current = { x: smoothX, y: smoothY };
 
+    // Select active output coordinates based on chosen mode
+    const mode = positioningModeRef.current;
+    let actX = smoothX;
+    let actY = smoothY;
+    if (mode === "ble") {
+      actX = bleSol.x;
+      actY = bleSol.y;
+    } else if (mode === "pdr") {
+      actX = pdr.x;
+      actY = pdr.y;
+    }
+
     // Trail update
     const trail = trailRef.current;
-    if (trail.length === 0 || Math.hypot(smoothX - trail[trail.length - 1].x, smoothY - trail[trail.length - 1].y) > 0.20) {
-      trail.push({ x: smoothX, y: smoothY });
+    if (trail.length === 0 || Math.hypot(actX - trail[trail.length - 1].x, actY - trail[trail.length - 1].y) > 0.20) {
+      trail.push({ x: actX, y: actY });
       if (trail.length > MAX_TRAIL_POINTS) trail.shift();
+    }
+
+    // Ground truth benchmark error
+    const gt = groundTruthRef.current;
+    let gtErrorFt = null;
+    let accuracyScore = null;
+    if (gt) {
+      gtErrorFt = Number(Math.hypot(actX - gt.x, actY - gt.y).toFixed(2));
+      accuracyScore = Math.max(0, Math.min(100, Math.round((1 - gtErrorFt / 12) * 100)));
     }
 
     // Store refs
@@ -348,6 +388,8 @@ export function useTwoBeaconPositioning({
       pdrY:       pdr.y,
       fusedX:     smoothX,
       fusedY:     smoothY,
+      activeX:    actX,
+      activeY:    actY,
       confidence: bleSol.confidence,
     };
 
@@ -358,8 +400,13 @@ export function useTwoBeaconPositioning({
       bleX: bleSol.x, bleY: bleSol.y,
       pdrX: pdr.x,    pdrY: pdr.y,
       fusedX: smoothX, fusedY: smoothY,
+      activeX: actX,   activeY: actY,
       confidence: bleSol.confidence,
       isStationary,
+      positioningMode: mode,
+      groundTruth: gt,
+      gtErrorFt,
+      accuracyScore,
       b1Available: s1.filteredRssi !== null && age1 < 3000,
       b2Available: s2.filteredRssi !== null && age2 < 3000,
     };
@@ -415,17 +462,25 @@ export function useTwoBeaconPositioning({
       _setModuleState("STOPPED");
     },
 
-    resetPosition: () => {
-      const cx = (configRef.current.beacon1X + configRef.current.beacon2X) / 2;
-      const cy = (configRef.current.beacon1Y + configRef.current.beacon2Y) / 2;
+    resetPosition: (customX = null, customY = null) => {
+      const cx = (customX !== null && isFinite(customX)) ? customX : ((configRef.current.beacon1X + configRef.current.beacon2X) / 2);
+      const cy = (customY !== null && isFinite(customY)) ? customY : ((configRef.current.beacon1Y + configRef.current.beacon2Y) / 2);
       kalmanRef.current.reset(cx, cy);
       pdrPosRef.current     = { x: cx, y: cy };
       prevFusedRef.current  = { x: cx, y: cy };
       displayPosRef.current = { x: cx, y: cy };
       trailRef.current      = [{ x: cx, y: cy }];
-      positionRef.current   = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, confidence: 0 };
+      positionRef.current   = { bleX: cx, bleY: cy, pdrX: cx, pdrY: cy, fusedX: cx, fusedY: cy, activeX: cx, activeY: cy, confidence: 0 };
       setPositionState({ ...positionRef.current, timestamp: Date.now() });
       setTrail([{ x: cx, y: cy }]);
+    },
+
+    setPositioningMode: (m) => {
+      setPositioningMode(m);
+    },
+
+    setGroundTruth: (pt) => {
+      setGroundTruth(pt);
     },
 
     addManualStep: (stepFt = 2.3, headingDeg = 0) => {
@@ -438,7 +493,10 @@ export function useTwoBeaconPositioning({
       kalmanRef.current.predict(dx, dy);
       const fused = kalmanRef.current.getPosition();
       displayPosRef.current = { x: fused.x, y: fused.y };
-      trailRef.current.push({ x: fused.x, y: fused.y });
+      const mode = positioningModeRef.current;
+      const actX = mode === "pdr" ? pdrPosRef.current.x : mode === "ble" ? positionRef.current.bleX : fused.x;
+      const actY = mode === "pdr" ? pdrPosRef.current.y : mode === "ble" ? positionRef.current.bleY : fused.y;
+      trailRef.current.push({ x: actX, y: actY });
       if (trailRef.current.length > MAX_TRAIL_POINTS) trailRef.current.shift();
       positionRef.current = {
         ...positionRef.current,
@@ -446,6 +504,8 @@ export function useTwoBeaconPositioning({
         pdrY: pdrPosRef.current.y,
         fusedX: fused.x,
         fusedY: fused.y,
+        activeX: actX,
+        activeY: actY,
       };
       setPositionState({ ...positionRef.current, timestamp: Date.now() });
       setTrail([...trailRef.current]);
@@ -486,6 +546,8 @@ export function useTwoBeaconPositioning({
     positionState,
     trail,
     debugInfo,
+    positioningMode,
+    groundTruth,
     // Actions
     actions,
   };

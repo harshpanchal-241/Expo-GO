@@ -72,6 +72,18 @@ export default function AppAndroid() {
   const gravityRef = useRef(1.0);
   const hasMotionRotationRef = useRef(false);
 
+  // Robust Peak-Valley Step Detector State Machine
+  const stepStateRef = useRef({
+    state: "IDLE",            // "IDLE" | "ARMED_PEAK" | "ARMED_VALLEY"
+    peakVal: 0,
+    peakTime: 0,
+    valleyVal: 0,
+    valleyTime: 0,
+    filteredMag: 1.0,
+    varianceBuffer: [],
+    lastConfirmedStepTime: 0,
+  });
+
   // Load saved paths on mount
   useEffect(() => {
     loadSavedPathsHistory();
@@ -206,39 +218,96 @@ export default function AppAndroid() {
           setHeading(formatted);
         });
 
-        // 3. Dynamic Accelerometer Step Detector with Weinberg Stride Calculation
+        // 3. High-Precision Accelerometer Step Detector with Energy Gate & Peak-Valley State Machine
         Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
           if (!runningRef.current && !pdrStepCallbackRef.current) return;
           const { x, y, z } = data;
-          const mag = Math.sqrt(x * x + y * y + z * z); // in g
+          const rawMag = Math.sqrt(x * x + y * y + z * z); // in g
 
-          // Buffer acceleration magnitude for dynamic bounce swing analysis
-          stepAccelBufferRef.current.push(mag);
-          if (stepAccelBufferRef.current.length > 20) {
-            stepAccelBufferRef.current.shift();
+          const ss = stepStateRef.current;
+          const now = Date.now();
+
+          // Low-pass filter raw magnitude to strip high-frequency motor/sensor jitter
+          ss.filteredMag = 0.70 * ss.filteredMag + 0.30 * rawMag;
+
+          // Slow dynamic gravity tracker
+          gravityRef.current = 0.98 * gravityRef.current + 0.02 * ss.filteredMag;
+          const dynamicAccel = ss.filteredMag - gravityRef.current; // signed dynamic acceleration (g)
+
+          // Energy / Variance buffer (16 samples ≈ 480ms)
+          ss.varianceBuffer.push(dynamicAccel);
+          if (ss.varianceBuffer.length > 16) {
+            ss.varianceBuffer.shift();
           }
 
-          // Dynamic gravity baseline
-          gravityRef.current = 0.94 * gravityRef.current + 0.06 * mag;
-          const dynamicAccel = Math.abs(mag - gravityRef.current);
+          const bufLen = ss.varianceBuffer.length;
+          const mean = ss.varianceBuffer.reduce((acc, v) => acc + v, 0) / bufLen;
+          const variance = ss.varianceBuffer.reduce((acc, v) => acc + (v - mean) ** 2, 0) / bufLen;
 
-          const now = Date.now();
-          // Trigger step on impact peak with minimum step delay (300ms)
-          if (dynamicAccel > 0.16 && (now - lastStepTimeRef.current) > 300) {
-            lastStepTimeRef.current = now;
+          // Stationary Energy Gate (ZUPT): When standing still, variance is < 0.012 g²
+          // Completely suppresses false steps while stationary
+          if (variance < 0.012) {
+            ss.state = "IDLE";
+            return;
+          }
 
-            // Calculate Weinberg Dynamic Step Length based on peak-to-valley bounce
-            const buf = stepAccelBufferRef.current;
-            const maxAccel = buf.length > 0 ? Math.max(...buf) : mag;
-            const minAccel = buf.length > 0 ? Math.min(...buf) : mag;
-            stepAccelBufferRef.current = [];
+          // State Machine Thresholds
+          const PEAK_THRESHOLD = 0.20;    // +0.20g impact peak
+          const VALLEY_THRESHOLD = -0.16; // -0.16g swing trough
+          const MIN_CADENCE_MS = 280;     // max ~3.5 steps/sec
+          const MAX_CADENCE_MS = 1400;    // min ~0.7 steps/sec
 
-            const bounceDiff = Math.max(0.12, maxAccel - minAccel);
-            const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
-            const dynamicStepLen = Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
+          if (ss.state === "IDLE") {
+            if (dynamicAccel > PEAK_THRESHOLD) {
+              ss.state = "ARMED_PEAK";
+              ss.peakVal = dynamicAccel;
+              ss.peakTime = now;
+            }
+          } else if (ss.state === "ARMED_PEAK") {
+            if (dynamicAccel > ss.peakVal) {
+              ss.peakVal = dynamicAccel;
+              ss.peakTime = now;
+            } else if (dynamicAccel < 0.04 && (now - ss.peakTime) > 30) {
+              // Crossed zero line downward toward valley
+              ss.state = "ARMED_VALLEY";
+              ss.valleyVal = dynamicAccel;
+              ss.valleyTime = now;
+            } else if ((now - ss.peakTime) > 450) {
+              ss.state = "IDLE";
+            }
+          } else if (ss.state === "ARMED_VALLEY") {
+            if (dynamicAccel < ss.valleyVal) {
+              ss.valleyVal = dynamicAccel;
+              ss.valleyTime = now;
+            } else if (dynamicAccel > VALLEY_THRESHOLD && (now - ss.valleyTime) > 30) {
+              // Rebounded from valley! Validate full step cycle
+              const bounceDiff = ss.peakVal - ss.valleyVal;
+              const stepCadence = now - ss.lastConfirmedStepTime;
+              const peakToValleyDuration = ss.valleyTime - ss.peakTime;
 
-            addStep(dynamicStepLen, bounceDiff);
+              if (
+                bounceDiff >= 0.32 &&
+                stepCadence >= MIN_CADENCE_MS &&
+                stepCadence <= MAX_CADENCE_MS &&
+                peakToValleyDuration >= 50 &&
+                peakToValleyDuration <= 450
+              ) {
+                // CONFIRMED VALID STEP!
+                ss.lastConfirmedStepTime = now;
+                lastStepTimeRef.current = now;
+
+                // Weinberg Dynamic Step Length Model
+                const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
+                const dynamicStepLen = Number(Math.min(1.05, Math.max(0.50, estimated)).toFixed(2));
+
+                addStep(dynamicStepLen, bounceDiff);
+              }
+
+              ss.state = "IDLE";
+            } else if ((now - ss.valleyTime) > 400) {
+              ss.state = "IDLE";
+            }
           }
         });
 
@@ -422,7 +491,7 @@ export default function AppAndroid() {
         </View>
 
         {activeTab === "beacon" ? (
-          <TwoBeaconPositionScreen pdrStepCallbackRef={pdrStepCallbackRef} />
+          <TwoBeaconPositionScreen pdrStepCallbackRef={pdrStepCallbackRef} heading={heading} />
         ) : activeTab === "ble" ? (
           <BleScannerSection />
         ) : (
