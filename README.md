@@ -35,8 +35,9 @@ A cross-platform mobile application for real-time **Pedestrian Dead Reckoning (P
   - Android & iOS BLE scanning powered by `react-native-ble-plx` in `ScanMode.LowLatency`.
 - **Adaptive 1-Euro Signal Filtering**:
   - Eliminates RSSI multi-path noise and signal fluctuations while preserving instantaneous response during rapid movements.
-- **Distance Estimation**:
+- **Distance Estimation & Unit Conversion**:
   - Log-Distance Path Loss Model: $d = 10^{\frac{\text{TxPower} - \text{RSSI}}{10 \cdot n}}$
+  - Multi-unit live conversions with selectable units: **Meters (`m`)**, **Feet (`ft`)**, and **Inches (`in`)**.
   - Real-time calibration controls for **TxPower at 1m** and **Environmental Path Loss Exponent ($n$)**.
 - **Focused Single-Device Testing Mode**:
   - Isolate and test a single beacon with live distance sparkline mini-charts, signal quality gauges, and movement trends (*Approaching*, *Stationary*, *Moving Away*).

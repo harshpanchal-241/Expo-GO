@@ -48,6 +48,7 @@ export const DEFAULT_ENV_N = 2.2;
 // ============================================================================
 
 import { Platform, PermissionsAndroid, Alert, Linking, NativeModules } from "react-native";
+import { getAppSettings } from "./appSettingsStorage.js";
 
 let BleManager = null;
 try {
@@ -205,9 +206,29 @@ export class DeviceDistanceTracker {
 
   rssiToDistance(rssi) {
     if (!rssi || rssi === 0) return null;
-    const ratio = (this.txPower - rssi) / (10 * Math.max(1.0, this.envN));
-    return Math.pow(10, ratio);
+    const settings = getAppSettings();
+    const tx = this.txPower || settings.txPower || DEFAULT_TX_POWER;
+    const n = this.envN || settings.pathLossN || DEFAULT_ENV_N;
+    const ratio = (tx - rssi) / (10 * Math.max(1.0, n));
+    const rawMeters = Math.pow(10, ratio);
+
+    // Near-field smooth touch curve (eliminates 18-21cm floor)
+    if (settings.nearFieldCorrectionOn) {
+      const satRssi = settings.nearFieldSaturationRssi || -43;
+      if (rssi >= satRssi) {
+        return 0.0;
+      }
+      const nearFieldStart = -50; // zone where proximity touch curve takes effect
+      if (rssi > nearFieldStart) {
+        // Smoothly blend from rawMeters down to 0 as RSSI approaches satRssi
+        const factor = (satRssi - rssi) / (satRssi - nearFieldStart);
+        return rawMeters * Math.max(0, Math.min(1, factor));
+      }
+    }
+
+    return rawMeters;
   }
+
 
   addPacket(rawRssi, timestamp = Date.now()) {
     if (typeof rawRssi !== "number" || isNaN(rawRssi)) return;
@@ -334,9 +355,14 @@ export class DeviceDistanceTracker {
     const diff = this.targetDistance - this.currentDistance;
     const absDiff = Math.abs(diff);
 
-    // Dead Zone Hysteresis: ignore microscopic noise jitter when stationary
-    if (this.trend === "stationary" && absDiff < DEAD_ZONE) {
-      return Number(this.currentDistance.toFixed(2));
+    // If within 2 cm of target, smoothly lock directly onto target
+    if (absDiff <= 0.02) {
+      this.currentDistance = this.targetDistance;
+      const finalDist = Number(this.currentDistance.toFixed(2));
+      if (!this.distanceHistory) this.distanceHistory = [];
+      this.distanceHistory.push(finalDist);
+      if (this.distanceHistory.length > 20) this.distanceHistory.shift();
+      return finalDist;
     }
 
     // Adaptive step limit (kinematic walking speed limit)
@@ -350,7 +376,7 @@ export class DeviceDistanceTracker {
     }
 
     // Smooth proportional easing with kinematic ceiling
-    const dynamicStep = Math.min(stepLimit, Math.max(0.02, absDiff * 0.30));
+    const dynamicStep = Math.min(stepLimit, Math.max(0.015, absDiff * 0.25));
     const step = Math.sign(diff) * Math.min(absDiff, dynamicStep);
     this.currentDistance += step;
 
@@ -398,12 +424,74 @@ export class DeviceDistanceTracker {
 /**
  * Calculates raw estimated physical distance (in meters) from RSSI
  */
-export function calculateDistance(rssi, measuredPower = DEFAULT_TX_POWER, pathLossExponent = DEFAULT_ENV_N) {
+export function calculateDistance(rssi, measuredPower = null, pathLossExponent = null) {
   if (!rssi || rssi === 0) return null;
-  const ratio = (measuredPower - rssi) / (10 * pathLossExponent);
-  const distance = Math.pow(10, ratio);
-  return Number(distance.toFixed(2));
+  const settings = getAppSettings();
+  const tx = measuredPower !== null ? measuredPower : (settings.txPower || DEFAULT_TX_POWER);
+  const n = pathLossExponent !== null ? pathLossExponent : (settings.pathLossN || DEFAULT_ENV_N);
+  const ratio = (tx - rssi) / (10 * Math.max(1.0, n));
+  let dist = Math.pow(10, ratio);
+
+  // Near-field smooth touch curve (eliminates 18-21cm floor)
+  if (settings.nearFieldCorrectionOn) {
+    const satRssi = settings.nearFieldSaturationRssi || -43;
+    if (rssi >= satRssi) return 0.0;
+    if (rssi > -50) {
+      const factor = (satRssi - rssi) / (satRssi - (-50));
+      dist = dist * Math.max(0, Math.min(1, factor));
+    }
+  }
+
+  return Number(dist.toFixed(2));
 }
+
+
+/**
+ * Converts distance in meters to target unit ('m' | 'ft' | 'in')
+ */
+export function convertMeters(meters, unit = "m") {
+  if (meters === null || meters === undefined || isNaN(meters)) return null;
+  if (unit === "ft") {
+    return Number((meters * 3.28084).toFixed(2));
+  }
+  if (unit === "in") {
+    return Number((meters * 39.3701).toFixed(1));
+  }
+  return Number(meters.toFixed(2));
+}
+
+/**
+ * Formats distance in meters according to selected unit
+ */
+export function formatDistance(meters, unit = "m") {
+  const label = unit === "ft" ? "feet" : unit === "in" ? "inches" : "meters";
+  if (meters === null || meters === undefined || isNaN(meters)) {
+    return { value: "--", unit, label };
+  }
+  if (unit === "ft") {
+    return { value: (meters * 3.28084).toFixed(2), unit: "ft", label };
+  }
+  if (unit === "in") {
+    return { value: (meters * 39.3701).toFixed(1), unit: "in", label };
+  }
+  return { value: meters.toFixed(2), unit: "m", label };
+}
+
+/**
+ * Returns formatted distance strings in all three units simultaneously
+ */
+export function getDistanceConversions(meters) {
+  if (meters === null || meters === undefined || isNaN(meters)) {
+    return { m: "--", ft: "--", in: "--" };
+  }
+  return {
+    m: `${meters.toFixed(2)} m`,
+    ft: `${(meters * 3.28084).toFixed(2)} ft`,
+    in: `${(meters * 39.3701).toFixed(1)} in`,
+  };
+}
+
+
 
 /**
  * Categorize RSSI into human readable signal quality and color scheme
@@ -467,32 +555,32 @@ export async function ensureBluetoothEnabled() {
   try {
     const state = await manager.state();
     if (state === "PoweredOff") {
-      if (Platform.OS === "android") {
-        try {
-          await manager.enable();
-          return true;
-        } catch (e) {
-          Alert.alert(
-            "Bluetooth is Disabled",
-            "Please turn on Bluetooth in your device settings to scan for nearby BLE beacons.",
-            [
-              { text: "Cancel", style: "cancel" },
-              { text: "Open Settings", onPress: () => Linking.openSettings() }
-            ]
-          );
-          return false;
-        }
-      } else {
+      return new Promise((resolve) => {
         Alert.alert(
-          "Bluetooth is Disabled",
-          "Please turn on Bluetooth in Settings to discover nearby beacons.",
+          "Bluetooth is Turned Off",
+          "Bluetooth is required to scan for nearby BLE beacons and estimate distance. Would you like to turn it on now?",
           [
-            { text: "Cancel", style: "cancel" },
-            { text: "Open Settings", onPress: () => Linking.openSettings() }
+            { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+            {
+              text: "Turn On",
+              onPress: async () => {
+                try {
+                  if (Platform.OS === "android" && manager.enable) {
+                    await manager.enable();
+                    resolve(true);
+                  } else {
+                    Linking.openSettings();
+                    resolve(false);
+                  }
+                } catch (e) {
+                  Linking.openSettings();
+                  resolve(false);
+                }
+              },
+            },
           ]
         );
-        return false;
-      }
+      });
     }
     return state === "PoweredOn";
   } catch (err) {

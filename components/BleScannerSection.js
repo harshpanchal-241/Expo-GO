@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import {
   View,
   Text,
@@ -8,7 +8,9 @@ import {
   ActivityIndicator,
   Alert,
   Switch,
-  Dimensions
+  Dimensions,
+  Platform,
+  Linking,
 } from "react-native";
 import Svg, { Polyline, Circle, Line } from "react-native-svg";
 import {
@@ -20,17 +22,26 @@ import {
   UI_UPDATE_INTERVAL_MS,
   INITIAL_SAMPLE_SIZE,
   DEFAULT_TX_POWER,
-  DEFAULT_ENV_N
+  DEFAULT_ENV_N,
+  convertMeters,
+  formatDistance,
+  getDistanceConversions,
 } from "../services/BleScannerService.js";
+import { getAppSettings, subscribeAppSettings } from "../services/appSettingsStorage.js";
+import BleDistanceRssiTestPanel from "./BleDistanceRssiTestPanel.js";
 
 export default function BleScannerSection() {
+  const initialSettings = getAppSettings();
   const [isScanning, setIsScanning] = useState(false);
   const [devices, setDevices] = useState({});
   const [bluetoothStatus, setBluetoothStatus] = useState("Unknown");
   const [filterNamedOnly, setFilterNamedOnly] = useState(false);
-  const [environmentalN, setEnvironmentalN] = useState(DEFAULT_ENV_N);
-  const [txPower1m, setTxPower1m] = useState(DEFAULT_TX_POWER);
+  const [environmentalN, setEnvironmentalN] = useState(initialSettings.pathLossN || DEFAULT_ENV_N);
+  const [txPower1m, setTxPower1m] = useState(initialSettings.txPower || DEFAULT_TX_POWER);
   const [isExpoGoNotice, setIsExpoGoNotice] = useState(false);
+
+  // Unit of distance measurement: 'm' (meters), 'ft' (feet), or 'in' (inches)
+  const [distanceUnit, setDistanceUnit] = useState(initialSettings.distanceUnit || "m");
 
   // Single Focused Device for Dedicated Testing
   const [focusedDeviceId, setFocusedDeviceId] = useState(null);
@@ -42,6 +53,16 @@ export default function BleScannerSection() {
   // Per-device filter state machines (independent from React render cycles)
   const trackersRef = useRef(new Map());
   const deviceMetaRef = useRef(new Map());
+
+  // Listen to in-app settings changes live
+  useEffect(() => {
+    const unsub = subscribeAppSettings((newCfg) => {
+      if (newCfg.txPower) setTxPower1m(newCfg.txPower);
+      if (newCfg.pathLossN) setEnvironmentalN(newCfg.pathLossN);
+      if (newCfg.distanceUnit) setDistanceUnit(newCfg.distanceUnit);
+    });
+    return () => unsub();
+  }, []);
 
   // Keep tracker parameters updated if txPower or environmentalN changes
   useEffect(() => {
@@ -77,6 +98,37 @@ export default function BleScannerSection() {
   }, []);
 
   // --------------------------------------------------------------------------
+  const hasPromptedOffRef = useRef(false);
+
+  // --------------------------------------------------------------------------
+  // Bluetooth Turn On Popup Dialog
+  // --------------------------------------------------------------------------
+  const promptTurnOnBluetooth = useCallback(() => {
+    const mgr = managerRef.current;
+    Alert.alert(
+      "Bluetooth is Turned Off",
+      "Bluetooth is required to scan for nearby BLE beacons and estimate distance. Would you like to turn it on now?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Turn On",
+          onPress: async () => {
+            try {
+              if (Platform.OS === "android" && mgr && mgr.enable) {
+                await mgr.enable();
+              } else {
+                Linking.openSettings();
+              }
+            } catch (e) {
+              Linking.openSettings();
+            }
+          },
+        },
+      ]
+    );
+  }, []);
+
+  // --------------------------------------------------------------------------
   // BLE Manager Setup & State Listener
   // --------------------------------------------------------------------------
   useEffect(() => {
@@ -93,8 +145,16 @@ export default function BleScannerSection() {
     try {
       subscription = mgr.onStateChange((state) => {
         setBluetoothStatus(state);
-        if (state === "PoweredOff" && isScanningRef.current) {
-          stopScan();
+        if (state === "PoweredOff") {
+          if (isScanningRef.current) {
+            stopScan();
+          }
+          if (!hasPromptedOffRef.current) {
+            hasPromptedOffRef.current = true;
+            promptTurnOnBluetooth();
+          }
+        } else if (state === "PoweredOn") {
+          hasPromptedOffRef.current = false;
         }
       }, true);
     } catch (e) {
@@ -112,7 +172,7 @@ export default function BleScannerSection() {
         clearInterval(simIntervalRef.current);
       }
     };
-  }, []);
+  }, [promptTurnOnBluetooth]);
 
   const handleToggleScan = async () => {
     if (isScanning) {
@@ -161,6 +221,11 @@ export default function BleScannerSection() {
           "Permission Required",
           "Bluetooth and Location permissions are required to detect nearby BLE beacons and estimate distance."
         );
+        return;
+      }
+
+      if (bluetoothStatus === "PoweredOff") {
+        promptTurnOnBluetooth();
         return;
       }
 
@@ -262,6 +327,21 @@ export default function BleScannerSection() {
         )}
       </View>
 
+      {/* Bluetooth Turned Off Alert Banner */}
+      {bluetoothStatus === "PoweredOff" && (
+        <View style={s.btOffBanner}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.btOffTitle}>⚠️ Bluetooth is Turned Off</Text>
+            <Text style={s.btOffSub}>
+              Enable Bluetooth to discover nearby BLE beacons and estimate distance.
+            </Text>
+          </View>
+          <Pressable style={s.btOffBtn} onPress={promptTurnOnBluetooth}>
+            <Text style={s.btOffBtnText}>Turn On</Text>
+          </Pressable>
+        </View>
+      )}
+
       {/* Control Buttons */}
       <View style={s.btnRow}>
         <Pressable
@@ -320,15 +400,79 @@ export default function BleScannerSection() {
             </View>
           </View>
 
-          {/* Big Hero Distance Display */}
+          {/* Big Hero Distance Display with Multi-Unit Conversions */}
           <View style={s.focusedHeroBox}>
-            <Text style={s.focusedHeroTitle}>ESTIMATED PHYSICAL DISTANCE</Text>
+            <View style={s.heroTitleRow}>
+              <Text style={s.focusedHeroTitle}>ESTIMATED PHYSICAL DISTANCE</Text>
+              {/* Mini Unit Selector Button Group */}
+              <View style={s.heroMiniToggle}>
+                {[
+                  { id: "m", label: "m" },
+                  { id: "ft", label: "ft" },
+                  { id: "in", label: "in" },
+                ].map((u) => (
+                  <Pressable
+                    key={u.id}
+                    onPress={() => setDistanceUnit(u.id)}
+                    style={[s.miniToggleBtn, distanceUnit === u.id && s.miniToggleBtnActive]}
+                  >
+                    <Text style={[s.miniToggleText, distanceUnit === u.id && s.miniToggleTextActive]}>
+                      {u.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
             <View style={s.focusedDistanceRow}>
               <Text style={s.focusedDistanceNumber}>
-                {focusedDevice.distance !== undefined && focusedDevice.distance !== null ? `${focusedDevice.distance}` : "--"}
+                {formatDistance(focusedDevice.distance, distanceUnit).value}
               </Text>
-              <Text style={s.focusedDistanceUnit}>meters</Text>
+              <Text style={s.focusedDistanceUnit}>
+                {formatDistance(focusedDevice.distance, distanceUnit).label}
+              </Text>
             </View>
+
+            {/* Live All-Unit Conversion Strip (Simultaneous m, ft, in Readouts) */}
+            {focusedDevice.distance !== undefined && focusedDevice.distance !== null && (
+              <View style={s.allConversionStrip}>
+                <Text style={s.allConversionTitle}>LIVE CONVERSIONS (TAP TO SELECT UNIT):</Text>
+                <View style={s.allConversionPills}>
+                  {/* Meters Pill */}
+                  <Pressable
+                    onPress={() => setDistanceUnit("m")}
+                    style={[s.allConvPill, distanceUnit === "m" && s.allConvPillActive]}
+                  >
+                    <Text style={[s.allConvUnit, distanceUnit === "m" && s.allConvTextActive]}>Meters (m)</Text>
+                    <Text style={[s.allConvVal, distanceUnit === "m" && s.allConvTextActive]}>
+                      {focusedDevice.distance.toFixed(2)} m
+                    </Text>
+                  </Pressable>
+
+                  {/* Feet Pill */}
+                  <Pressable
+                    onPress={() => setDistanceUnit("ft")}
+                    style={[s.allConvPill, distanceUnit === "ft" && s.allConvPillActive]}
+                  >
+                    <Text style={[s.allConvUnit, distanceUnit === "ft" && s.allConvTextActive]}>Feet (ft)</Text>
+                    <Text style={[s.allConvVal, distanceUnit === "ft" && s.allConvTextActive]}>
+                      {(focusedDevice.distance * 3.28084).toFixed(2)} ft
+                    </Text>
+                  </Pressable>
+
+                  {/* Inches Pill */}
+                  <Pressable
+                    onPress={() => setDistanceUnit("in")}
+                    style={[s.allConvPill, distanceUnit === "in" && s.allConvPillActive]}
+                  >
+                    <Text style={[s.allConvUnit, distanceUnit === "in" && s.allConvTextActive]}>Inches (in)</Text>
+                    <Text style={[s.allConvVal, distanceUnit === "in" && s.allConvTextActive]}>
+                      {(focusedDevice.distance * 39.3701).toFixed(1)} in
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            )}
 
             {/* Proximity Category Pill */}
             <View style={s.proximityPillRow}>
@@ -338,10 +482,15 @@ export default function BleScannerSection() {
                   focusedDevice.distance < 1.5 ? s.pillClose : (focusedDevice.distance < 4.0 ? s.pillMedium : s.pillFar)
                 ]}>
                   <Text style={s.proximityPillText}>
-                    {focusedDevice.distance < 1.5 ? "📍 Immediate Proximity (< 1.5m)" : (focusedDevice.distance < 4.0 ? "🚶 Room Range (1.5 - 4.0m)" : "📡 Distant Beacon (> 4.0m)")}
+                    {focusedDevice.distance < 1.5
+                      ? `📍 Immediate Proximity (< ${distanceUnit === "ft" ? "4.9 ft" : distanceUnit === "in" ? "59.1 in" : "1.5m"})`
+                      : (focusedDevice.distance < 4.0
+                          ? `🚶 Room Range (${distanceUnit === "ft" ? "4.9 - 13.1 ft" : distanceUnit === "in" ? "59.1 - 157.5 in" : "1.5 - 4.0m"})`
+                          : `📡 Distant Beacon (> ${distanceUnit === "ft" ? "13.1 ft" : distanceUnit === "in" ? "157.5 in" : "4.0m"})`)}
                   </Text>
                 </View>
               )}
+
 
               {/* Movement Trend Indicator */}
               <View style={[
@@ -377,12 +526,13 @@ export default function BleScannerSection() {
               <View style={s.sparklineHeader}>
                 <Text style={s.sparklineTitle}>Live Distance Trail (Last 20 Points)</Text>
                 <Text style={s.sparklineSub}>
-                  Latest: {focusedDevice.distance || "--"}m • Target: {focusedDevice.targetDistance || "--"}m
+                  Latest: {formatDistance(focusedDevice.distance, distanceUnit).value} {distanceUnit} • Target: {formatDistance(focusedDevice.targetDistance, distanceUnit).value} {distanceUnit}
                 </Text>
               </View>
               <DistanceSparkline history={focusedDevice.distanceHistory} />
             </View>
           )}
+
 
           {/* Real-time Beacon Calibration Controls */}
           <View style={s.calibrationCard}>
@@ -407,12 +557,50 @@ export default function BleScannerSection() {
               </View>
             </View>
           </View>
+
+          {/* Distance vs RSSI Testing & Graph Suite */}
+          <BleDistanceRssiTestPanel
+            devices={devices}
+            focusedDeviceId={focusedDeviceId}
+            distanceUnit={distanceUnit}
+            txPower1m={txPower1m}
+            environmentalN={environmentalN}
+          />
         </View>
       ) : (
         /* ==================================================================== */
         /* VIEW MODE B: ALL DISCOVERED DEVICES LIST */
         /* ==================================================================== */
         <>
+          {/* Distance Unit Selector Toolbar */}
+          <View style={s.unitToolbar}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Text style={s.unitToolbarLabel}>📏 Choose Unit:</Text>
+            </View>
+            <View style={s.unitButtonGroup}>
+              {[
+                { id: "m", label: "Meters (m)" },
+                { id: "ft", label: "Feet (ft)" },
+                { id: "in", label: "Inches (in)" },
+              ].map((item) => (
+                <Pressable
+                  key={item.id}
+                  onPress={() => setDistanceUnit(item.id)}
+                  style={[s.unitButton, distanceUnit === item.id && s.unitButtonActive]}
+                >
+                  <Text
+                    style={[
+                      s.unitButtonText,
+                      distanceUnit === item.id && s.unitButtonTextActive,
+                    ]}
+                  >
+                    {item.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
           {/* Pipeline Config & Tuning Indicators */}
           <View style={s.filterRow}>
             <View style={s.switchItem}>
@@ -493,14 +681,27 @@ export default function BleScannerSection() {
                       </View>
                     </View>
 
-                    {/* Primary Metric Hero: Smooth Distance */}
+                    {/* Primary Metric Hero: Smooth Distance with Dynamic Unit & Conversions */}
                     <View style={s.heroMetricBox}>
                       <View style={s.heroLeft}>
                         <Text style={s.heroLabel}>ESTIMATED DISTANCE</Text>
                         <Text style={s.heroValue}>
-                          {device.distance !== null ? `${device.distance}` : "--"}
-                          <Text style={s.heroUnit}> meters</Text>
+                          {formatDistance(device.distance, distanceUnit).value}
+                          <Text style={s.heroUnit}> {formatDistance(device.distance, distanceUnit).label}</Text>
                         </Text>
+                        {device.distance !== null && (
+                          <View style={s.deviceConversionsRow}>
+                            {distanceUnit !== "m" && (
+                              <Text style={s.deviceConversionSub}>• {device.distance.toFixed(2)}m </Text>
+                            )}
+                            {distanceUnit !== "ft" && (
+                              <Text style={s.deviceConversionSub}>• {(device.distance * 3.28084).toFixed(2)}ft </Text>
+                            )}
+                            {distanceUnit !== "in" && (
+                              <Text style={s.deviceConversionSub}>• {(device.distance * 39.3701).toFixed(1)}in</Text>
+                            )}
+                          </View>
+                        )}
                       </View>
 
                       <View style={s.heroDivider} />
@@ -545,6 +746,15 @@ export default function BleScannerSection() {
               })}
             </ScrollView>
           )}
+
+          {/* Distance vs RSSI Testing & Graph Suite */}
+          <BleDistanceRssiTestPanel
+            devices={devices}
+            focusedDeviceId={null}
+            distanceUnit={distanceUnit}
+            txPower1m={txPower1m}
+            environmentalN={environmentalN}
+          />
         </>
       )}
 
@@ -553,14 +763,15 @@ export default function BleScannerSection() {
 }
 
 // ----------------------------------------------------------------------------
-// Live Distance Sparkline Mini Chart Component
+// Live Distance Sparkline Mini Chart Component (Auto-Adjusted Width)
 // ----------------------------------------------------------------------------
 function DistanceSparkline({ history }) {
   if (!history || history.length < 2) return null;
 
+  const [sparklineWidth, setSparklineWidth] = useState(0);
   const screenWidth = Dimensions.get("window").width;
-  const width = Math.max(260, Math.min(screenWidth - 56, 360));
-  const height = 65;
+  const width = sparklineWidth > 100 ? sparklineWidth : Math.max(200, Math.min(screenWidth - 72, 360));
+  const height = 70;
   const pad = 8;
 
   const minVal = Math.max(0, Math.min(...history) - 0.3);
@@ -578,7 +789,13 @@ function DistanceSparkline({ history }) {
   const latestPt = points[points.length - 1];
 
   return (
-    <View style={{ alignItems: "center", marginVertical: 4 }}>
+    <View
+      style={{ alignItems: "center", marginVertical: 4, width: "100%" }}
+      onLayout={(e) => {
+        const w = Math.round(e.nativeEvent.layout.width);
+        if (w > 50 && Math.abs(w - sparklineWidth) > 3) setSparklineWidth(w);
+      }}
+    >
       <Svg width={width} height={height}>
         {/* Baseline grid */}
         <Line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#e1e4e8" strokeDasharray="3,3" />
@@ -620,8 +837,10 @@ const s = StyleSheet.create({
   headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "flex-start",
+    alignItems: "center",
     marginBottom: 10,
+    flexWrap: "wrap",
+    gap: 8,
   },
   sectionTitle: {
     fontSize: 16,
@@ -694,6 +913,8 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderColor: "#f0f2f5",
     marginBottom: 10,
+    flexWrap: "wrap",
+    gap: 8,
   },
   switchItem: {
     flexDirection: "row",
@@ -707,16 +928,17 @@ const s = StyleSheet.create({
   },
   paramBadge: {
     backgroundColor: "#f6f8fa",
-    paddingHorizontal: 6,
-    paddingVertical: 3,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     borderRadius: 6,
     borderWidth: 1,
     borderColor: "#e1e4e8",
+    flexShrink: 1,
   },
   paramText: {
     fontSize: 10,
     color: "#57606a",
-    fontFamily: "monospace",
+    fontFamily: Platform.OS === "android" ? "monospace" : "Menlo",
     fontWeight: "600",
   },
   summaryBar: {
@@ -724,6 +946,8 @@ const s = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 8,
+    flexWrap: "wrap",
+    gap: 6,
   },
   summaryText: {
     fontSize: 12,
@@ -1143,10 +1367,192 @@ const s = StyleSheet.create({
     borderColor: "#d0d7de",
     alignItems: "center",
   },
-  calibBtnText: {
+  btOffBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#fff1f0",
+    borderWidth: 1,
+    borderColor: "#ffa39e",
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 10,
+    gap: 8,
+  },
+  btOffTitle: {
     fontSize: 12,
     fontWeight: "800",
-    color: "#1f6feb",
+    color: "#cf1322",
+  },
+  btOffSub: {
+    fontSize: 10,
+    color: "#820014",
+    marginTop: 2,
+    lineHeight: 14,
+  },
+  btOffBtn: {
+    backgroundColor: "#cf1322",
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+  },
+  btOffBtnText: {
+    color: "#ffffff",
+    fontSize: 11,
+    fontWeight: "800",
   },
 
+  // Distance Unit Toolbar & Buttons
+  unitToolbar: {
+    backgroundColor: "#f6f8fa",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginBottom: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  unitToolbarLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#24292f",
+  },
+  unitButtonGroup: {
+    flexDirection: "row",
+    gap: 5,
+    flexWrap: "wrap",
+  },
+  unitButton: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+    backgroundColor: "#ffffff",
+  },
+  unitButtonActive: {
+    backgroundColor: "#1f6feb",
+    borderColor: "#1f6feb",
+  },
+  unitButtonText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#57606a",
+  },
+  unitButtonTextActive: {
+    color: "#ffffff",
+  },
+
+  // Focused Hero Header & Mini Toggle
+  heroTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    width: "100%",
+    marginBottom: 4,
+  },
+  heroMiniToggle: {
+    flexDirection: "row",
+    gap: 3,
+    backgroundColor: "#f6f8fa",
+    padding: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+  },
+  miniToggleBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  miniToggleBtnActive: {
+    backgroundColor: "#1f6feb",
+  },
+  miniToggleText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#57606a",
+  },
+  miniToggleTextActive: {
+    color: "#ffffff",
+  },
+
+  // All-Unit Live Conversion Strip
+  allConversionStrip: {
+    width: "100%",
+    backgroundColor: "#f6f8fa",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#e1e4e8",
+    padding: 8,
+    marginTop: 6,
+    marginBottom: 6,
+  },
+  allConversionTitle: {
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#57606a",
+    letterSpacing: 0.5,
+    marginBottom: 6,
+    textAlign: "center",
+  },
+  allConversionPills: {
+    flexDirection: "row",
+    gap: 6,
+    justifyContent: "space-between",
+  },
+  allConvPill: {
+    flex: 1,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+    alignItems: "center",
+  },
+  allConvPillActive: {
+    backgroundColor: "#ddf4ff",
+    borderColor: "#1f6feb",
+    borderWidth: 1.5,
+  },
+  allConvUnit: {
+    fontSize: 9,
+    color: "#57606a",
+    fontWeight: "700",
+  },
+  allConvVal: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#24292f",
+    marginTop: 2,
+  },
+  allConvTextActive: {
+    color: "#0969da",
+    fontWeight: "800",
+  },
+
+  // Device card conversion subtext
+  deviceConversionsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 4,
+    gap: 4,
+  },
+  deviceConversionSub: {
+    fontSize: 10,
+    color: "#0969da",
+    fontWeight: "700",
+    backgroundColor: "#f0f8ff",
+    borderWidth: 1,
+    borderColor: "#d0e8ff",
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+  },
 });
+

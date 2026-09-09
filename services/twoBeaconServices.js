@@ -4,6 +4,7 @@
 // ============================================================================
 
 import { OneEuroFilter } from "./BleScannerService.js";
+import { getAppSettings } from "./appSettingsStorage.js";
 
 // ============================================================================
 // ROOM CONSTANTS
@@ -128,8 +129,23 @@ export class RssiFilterPipeline {
 // ============================================================================
 export function rssiToDistance(filteredRssi, txPower, n, prevDistFt = null) {
   if (filteredRssi === null || filteredRssi === 0 || isNaN(filteredRssi)) return null;
+  const settings = getAppSettings();
+  const satRssi = settings.nearFieldSaturationRssi ?? -43;
+
   const ratio    = (txPower - filteredRssi) / (10 * Math.max(1.0, n));
-  const meters   = Math.pow(10, ratio);
+  let meters     = Math.pow(10, ratio);
+
+  // Near-field saturation correction: scale smoothly to 0 when touching beacon antenna
+  if (settings.enableNearFieldCurve && filteredRssi >= -50) {
+    if (filteredRssi >= satRssi) {
+      meters = 0.0;
+    } else {
+      const span = satRssi - (-50);
+      const progress = Math.max(0, Math.min(1, (filteredRssi - (-50)) / span));
+      meters = meters * Math.pow(1 - progress, 1.4);
+    }
+  }
+
   const rawFeet  = meters * 3.28084;
   if (!isFinite(rawFeet) || rawFeet < 0) return null;
 

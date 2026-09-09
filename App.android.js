@@ -17,6 +17,8 @@ import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./
 import BleScannerSection from "./components/BleScannerSection.js";
 import OtaUpdateCard from "./components/OtaUpdateCard.js";
 import TwoBeaconPositionScreen from "./components/TwoBeaconPositionScreen.js";
+import AppSettingsScreen from "./components/AppSettingsScreen.js";
+import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStorage.js";
 
 const norm = d => {
   let x = d % 360;
@@ -55,8 +57,12 @@ export default function AppAndroid() {
   const [savedPaths, setSavedPaths] = useState([]);
   const [selectedPreviousPath, setSelectedPreviousPath] = useState(null);
 
-  // Mode switch: 'pdr' | 'ble' | 'beacon'
+  // Mode switch: 'pdr' | 'ble' | 'beacon' | 'settings'
   const [activeTab, setActiveTab] = useState("pdr");
+
+  // Dynamic In-App Settings
+  const [appSettings, setAppSettings] = useState(getAppSettings());
+  const appSettingsRef = useRef(getAppSettings());
 
   // PDR step callback ref — the 2-beacon positioning hook attaches here
   const pdrStepCallbackRef = useRef(null);
@@ -84,9 +90,14 @@ export default function AppAndroid() {
     lastConfirmedStepTime: 0,
   });
 
-  // Load saved paths on mount
+  // Load saved paths and subscribe to in-app settings on mount
   useEffect(() => {
     loadSavedPathsHistory();
+    const unsub = subscribeAppSettings(newSettings => {
+      appSettingsRef.current = newSettings;
+      setAppSettings(newSettings);
+    });
+    return () => unsub();
   }, []);
 
   const loadSavedPathsHistory = async () => {
@@ -245,21 +256,16 @@ export default function AppAndroid() {
           const mean = ss.varianceBuffer.reduce((acc, v) => acc + v, 0) / bufLen;
           const variance = ss.varianceBuffer.reduce((acc, v) => acc + (v - mean) ** 2, 0) / bufLen;
 
-          // Stationary Energy Gate (ZUPT): When standing still, variance is < 0.012 g²
-          // Completely suppresses false steps while stationary
-          if (variance < 0.012) {
-            ss.state = "IDLE";
-            return;
-          }
+          const currentSettings = appSettingsRef.current || {};
+          const zuptThresh = currentSettings.zuptVariance ?? 0.005;
+          const peakThresh = currentSettings.peakThreshold ?? 0.12;
+          const valleyThresh = currentSettings.valleyThreshold ?? -0.09;
+          const bounceMin = currentSettings.bounceDiffMin ?? 0.18;
+          const kVal = currentSettings.weinbergK ?? WEINBERG_K;
 
-          // State Machine Thresholds
-          const PEAK_THRESHOLD = 0.20;    // +0.20g impact peak
-          const VALLEY_THRESHOLD = -0.16; // -0.16g swing trough
-          const MIN_CADENCE_MS = 280;     // max ~3.5 steps/sec
-          const MAX_CADENCE_MS = 1400;    // min ~0.7 steps/sec
-
+          // State Machine: ZUPT gate ONLY prevents starting when standing completely still
           if (ss.state === "IDLE") {
-            if (dynamicAccel > PEAK_THRESHOLD) {
+            if (variance >= zuptThresh && dynamicAccel > peakThresh) {
               ss.state = "ARMED_PEAK";
               ss.peakVal = dynamicAccel;
               ss.peakTime = now;
@@ -268,51 +274,73 @@ export default function AppAndroid() {
             if (dynamicAccel > ss.peakVal) {
               ss.peakVal = dynamicAccel;
               ss.peakTime = now;
-            } else if (dynamicAccel < 0.04 && (now - ss.peakTime) > 30) {
+            } else if (dynamicAccel < 0.03 && (now - ss.peakTime) > 30) {
               // Crossed zero line downward toward valley
               ss.state = "ARMED_VALLEY";
               ss.valleyVal = dynamicAccel;
               ss.valleyTime = now;
-            } else if ((now - ss.peakTime) > 450) {
+            } else if ((now - ss.peakTime) > 650) {
               ss.state = "IDLE";
             }
           } else if (ss.state === "ARMED_VALLEY") {
             if (dynamicAccel < ss.valleyVal) {
               ss.valleyVal = dynamicAccel;
               ss.valleyTime = now;
-            } else if (dynamicAccel > VALLEY_THRESHOLD && (now - ss.valleyTime) > 30) {
+            } else if (dynamicAccel > valleyThresh && (now - ss.valleyTime) > 30) {
               // Rebounded from valley! Validate full step cycle
               const bounceDiff = ss.peakVal - ss.valleyVal;
               const stepCadence = now - ss.lastConfirmedStepTime;
               const peakToValleyDuration = ss.valleyTime - ss.peakTime;
 
               if (
-                bounceDiff >= 0.32 &&
-                stepCadence >= MIN_CADENCE_MS &&
-                stepCadence <= MAX_CADENCE_MS &&
-                peakToValleyDuration >= 50 &&
-                peakToValleyDuration <= 450
+                bounceDiff >= bounceMin &&
+                stepCadence >= 250 &&
+                stepCadence <= 1600 &&
+                peakToValleyDuration >= 40 &&
+                peakToValleyDuration <= 700
               ) {
-                // CONFIRMED VALID STEP!
+                // CONFIRMED VALID ACCELEROMETER STEP!
                 ss.lastConfirmedStepTime = now;
                 lastStepTimeRef.current = now;
 
                 // Weinberg Dynamic Step Length Model
-                const estimated = WEINBERG_K * Math.pow(bounceDiff, 0.25);
-                const dynamicStepLen = Number(Math.min(1.05, Math.max(0.50, estimated)).toFixed(2));
+                const estimated = kVal * Math.pow(bounceDiff, 0.25);
+                const dynamicStepLen = Number(Math.min(1.05, Math.max(0.45, estimated)).toFixed(2));
 
                 addStep(dynamicStepLen, bounceDiff);
               }
 
               ss.state = "IDLE";
-            } else if ((now - ss.valleyTime) > 400) {
+            } else if ((now - ss.valleyTime) > 600) {
               ss.state = "IDLE";
             }
           }
         });
 
-        // 4. Hardware Pedometer backup
-        pedSub = Pedometer.watchStepCount(result => {});
+        // 4. Native Hardware Pedometer Fusion (Sensor Hub backup)
+        let lastPedometerTotal = null;
+        pedSub = Pedometer.watchStepCount(result => {
+          if (!runningRef.current && !pdrStepCallbackRef.current) return;
+          if (!result || typeof result.steps !== "number") return;
+
+          if (lastPedometerTotal === null) {
+            lastPedometerTotal = result.steps;
+            return;
+          }
+
+          const diffSteps = result.steps - lastPedometerTotal;
+          if (diffSteps > 0) {
+            lastPedometerTotal = result.steps;
+            const now = Date.now();
+            const ss = stepStateRef.current;
+            // Redundant fusion: If accelerometer hasn't detected a step in the last 280ms, register native step
+            if (now - ss.lastConfirmedStepTime > 280) {
+              ss.lastConfirmedStepTime = now;
+              lastStepTimeRef.current = now;
+              addStep(0.70, 0.25);
+            }
+          }
+        });
 
       } catch (e) {
         if (isMounted) setStatus("Sensor Error: " + (e?.message || String(e)));
@@ -477,7 +505,7 @@ export default function AppAndroid() {
             style={[s.tabBtn, activeTab === "ble" && s.tabBtnActive]}
           >
             <Text style={[s.tabBtnText, activeTab === "ble" && s.tabBtnTextActive]}>
-              📶 BLE Scan
+              📶 BLE
             </Text>
           </Pressable>
           <Pressable
@@ -488,9 +516,19 @@ export default function AppAndroid() {
               🛰️ 2-Beacon
             </Text>
           </Pressable>
+          <Pressable
+            onPress={() => setActiveTab("settings")}
+            style={[s.tabBtn, activeTab === "settings" && s.tabBtnActive]}
+          >
+            <Text style={[s.tabBtnText, activeTab === "settings" && s.tabBtnTextActive]}>
+              ⚙️ Settings
+            </Text>
+          </Pressable>
         </View>
 
-        {activeTab === "beacon" ? (
+        {activeTab === "settings" ? (
+          <AppSettingsScreen />
+        ) : activeTab === "beacon" ? (
           <TwoBeaconPositionScreen pdrStepCallbackRef={pdrStepCallbackRef} heading={heading} />
         ) : activeTab === "ble" ? (
           <BleScannerSection />
@@ -522,7 +560,7 @@ export default function AppAndroid() {
               <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
                 <Text style={s.label}>Dynamic Sensor Step Estimation</Text>
                 <View style={s.autoBadge}>
-                  <Text style={s.autoBadgeText}>⚡ Auto Weinberg ($K=0.74$)</Text>
+                  <Text style={s.autoBadgeText}>⚡ Auto Weinberg (K={(appSettings?.weinbergK ?? 0.74).toFixed(2)})</Text>
                 </View>
               </View>
               <Text style={{ fontSize: 12, color: "#57606a", marginTop: 2 }}>
@@ -813,15 +851,17 @@ const s = StyleSheet.create({
     flexDirection: "row",
     backgroundColor: "#e1e4e8",
     borderRadius: 12,
-    padding: 4,
+    padding: 3,
     marginBottom: 14,
-    gap: 4
+    gap: 3,
   },
   tabBtn: {
     flex: 1,
-    paddingVertical: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 2,
     alignItems: "center",
-    borderRadius: 8
+    justifyContent: "center",
+    borderRadius: 8,
   },
   tabBtnActive: {
     backgroundColor: "#ffffff",
@@ -829,15 +869,17 @@ const s = StyleSheet.create({
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.1,
     shadowRadius: 2,
-    elevation: 2
+    elevation: 2,
   },
   tabBtnText: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: "700",
-    color: "#57606a"
+    color: "#57606a",
+    textAlign: "center",
   },
   tabBtnTextActive: {
-    color: "#1f6feb"
+    color: "#1f6feb",
+    fontWeight: "800",
   },
 
   // Legend styles
@@ -854,7 +896,7 @@ const s = StyleSheet.create({
   savedTitle: { fontWeight: "700", fontSize: 13, color: "#24292f" },
   savedMeta: { fontSize: 11, color: "#57606a", marginTop: 1 },
   savedMetaSub: { fontSize: 11, color: "#0969da", fontWeight: "600", marginTop: 1 },
-  actionBtn: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 6, borderWidth: 1, alignItems: "center" },
+  actionBtn: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 6, borderWidth: 1, alignItems: "center", flexShrink: 0 },
   actionBtnOutline: { borderColor: "#1f6feb", backgroundColor: "white" },
   actionBtnActive: { backgroundColor: "#d97706", borderColor: "#d97706" },
   actionBtnDanger: { borderColor: "#ffc9c9", backgroundColor: "#fff0f0" },

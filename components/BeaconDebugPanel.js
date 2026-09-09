@@ -23,6 +23,7 @@ export default function BeaconDebugPanel({
   const [gtXInput,    setGtXInput]    = useState("");
   const [gtYInput,    setGtYInput]    = useState("");
   const [expanded,    setExpanded]    = useState(true);
+  const [unit,        setUnit]        = useState("ft"); // "ft" | "m" | "in"
 
   const { b1 = {}, b2 = {},
     bleX = 0, bleY = 0,
@@ -45,13 +46,41 @@ export default function BeaconDebugPanel({
   const confPct = (confidence * 100).toFixed(0);
   const confColor = confidence > 0.65 ? "#1a7f37" : confidence > 0.35 ? "#d29922" : "#cf222e";
 
+  function formatCoord(feetVal) {
+    if (feetVal === null || feetVal === undefined || isNaN(feetVal)) return "—";
+    if (unit === "m") return `${(feetVal * 0.3048).toFixed(2)}m`;
+    if (unit === "in") return `${(feetVal * 12).toFixed(1)}in`;
+    return `${feetVal.toFixed(2)}ft`;
+  }
+
   return (
     <View style={styles.card}>
-      {/* Header */}
-      <Pressable onPress={() => setExpanded(e => !e)} style={styles.headerRow}>
-        <Text style={styles.title}>🔍 Live Debug Panel</Text>
-        <Text style={styles.chevron}>{expanded ? "▲" : "▼"}</Text>
-      </Pressable>
+      {/* Header with Unit Selector */}
+      <View style={styles.headerRow}>
+        <Pressable onPress={() => setExpanded(e => !e)} style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1 }}>
+          <Text style={styles.title}>🔍 Live Debug Panel</Text>
+          <Text style={styles.chevron}>{expanded ? "▲" : "▼"}</Text>
+        </Pressable>
+
+        {/* Distance Unit Segmented Buttons */}
+        <View style={styles.unitSelector}>
+          {[
+            { id: "ft", label: "ft" },
+            { id: "m",  label: "m" },
+            { id: "in", label: "in" },
+          ].map((u) => (
+            <Pressable
+              key={u.id}
+              onPress={() => setUnit(u.id)}
+              style={[styles.unitBtn, unit === u.id && styles.unitBtnActive]}
+            >
+              <Text style={[styles.unitBtnText, unit === u.id && styles.unitBtnTextActive]}>
+                {u.label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      </View>
 
       {expanded && (
         <>
@@ -64,6 +93,7 @@ export default function BeaconDebugPanel({
             distanceFt={b1.distanceFt}
             weight={b1.weight}
             color="#0369a1"
+            unit={unit}
           />
 
           {/* Beacon 2 */}
@@ -75,6 +105,7 @@ export default function BeaconDebugPanel({
             distanceFt={b2.distanceFt}
             weight={b2.weight}
             color="#6d28d9"
+            unit={unit}
           />
 
           {/* Position table */}
@@ -82,19 +113,19 @@ export default function BeaconDebugPanel({
             <View style={styles.posRow}>
               <Text style={styles.posLabel}>BLE Position</Text>
               <Text style={styles.posValue}>
-                X: {bleX.toFixed(2)} ft  Y: {bleY.toFixed(2)} ft
+                X: {formatCoord(bleX)}  Y: {formatCoord(bleY)}
               </Text>
             </View>
             <View style={styles.posRow}>
               <Text style={styles.posLabel}>PDR Position</Text>
               <Text style={styles.posValue}>
-                X: {pdrX.toFixed(2)} ft  Y: {pdrY.toFixed(2)} ft
+                X: {formatCoord(pdrX)}  Y: {formatCoord(pdrY)}
               </Text>
             </View>
             <View style={[styles.posRow, { borderBottomWidth: 0 }]}>
               <Text style={[styles.posLabel, { fontWeight: "800", color: "#1d4ed8" }]}>Fused Position</Text>
               <Text style={[styles.posValue, { fontWeight: "800", color: "#1d4ed8" }]}>
-                X: {fusedX.toFixed(2)} ft  Y: {fusedY.toFixed(2)} ft
+                X: {formatCoord(fusedX)}  Y: {formatCoord(fusedY)}
               </Text>
             </View>
           </View>
@@ -110,7 +141,7 @@ export default function BeaconDebugPanel({
 
           {/* Ground truth error */}
           <View style={styles.gtRow}>
-            <Text style={styles.gtLabel}>Ground Truth (ft)</Text>
+            <Text style={styles.gtLabel}>Ground Truth ({unit})</Text>
             <View style={styles.gtInputs}>
               <TextInput
                 style={styles.gtInput}
@@ -137,9 +168,14 @@ export default function BeaconDebugPanel({
           </View>
 
           {errorFt !== null && (
-            <Text style={styles.errorText}>
-              📏 Position Error: <Text style={{ color: "#cf222e" }}>{errorFt} ft</Text>
-            </Text>
+            <View style={{ marginTop: 6, marginBottom: 2 }}>
+              <Text style={styles.errorText}>
+                📏 Position Error: <Text style={{ color: "#cf222e", fontWeight: "800" }}>{formatCoord(parseFloat(errorFt))}</Text>
+              </Text>
+              <Text style={{ fontSize: 10, color: "#57606a", marginTop: 1 }}>
+                Conversions: {unit !== "ft" ? `${parseFloat(errorFt).toFixed(2)}ft ` : ""}{unit !== "m" ? `• ${(parseFloat(errorFt) * 0.3048).toFixed(2)}m ` : ""}{unit !== "in" ? `• ${(parseFloat(errorFt) * 12).toFixed(1)}in` : ""}
+              </Text>
+            </View>
           )}
 
           {/* Debug overlays toggle */}
@@ -158,8 +194,16 @@ export default function BeaconDebugPanel({
   );
 }
 
-function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight, color }) {
+function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight, color, unit = "ft" }) {
   const dot = available ? "#1a7f37" : "#cf222e";
+
+  let distLabel = "—";
+  if (distanceFt !== null && distanceFt !== undefined) {
+    if (unit === "m") distLabel = `${(distanceFt * 0.3048).toFixed(2)}m`;
+    else if (unit === "in") distLabel = `${(distanceFt * 12).toFixed(1)}in`;
+    else distLabel = `${distanceFt.toFixed(1)}ft`;
+  }
+
   return (
     <View style={styles.beaconRow}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 4 }}>
@@ -168,14 +212,25 @@ function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight
         {!available && <Text style={styles.noSignal}>No Signal</Text>}
       </View>
       <View style={styles.beaconCells}>
-        <MiniCell label="Raw RSSI"   value={rawRssi      != null ? `${rawRssi} dBm`        : "—"} />
-        <MiniCell label="Filtered"   value={filteredRssi != null ? `${filteredRssi} dBm`   : "—"} />
-        <MiniCell label="Distance"   value={distanceFt   != null ? `${distanceFt.toFixed(1)} ft` : "—"} />
-        <MiniCell label="Weight"     value={weight       != null ? weight.toFixed(2)        : "—"} />
+        <MiniCell label="Raw RSSI"   value={rawRssi      != null ? `${rawRssi} dBm`      : "—"} />
+        <MiniCell label="Filtered"   value={filteredRssi != null ? `${filteredRssi} dBm` : "—"} />
+        <MiniCell label={`Dist (${unit})`} value={distLabel} />
+        <MiniCell label="Weight"     value={weight       != null ? weight.toFixed(2)      : "—"} />
       </View>
+      {distanceFt !== null && distanceFt !== undefined && (
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 4, gap: 6 }}>
+          <Text style={{ fontSize: 9, color: "#57606a" }}>
+            {unit !== "ft" ? `${distanceFt.toFixed(1)}ft  ` : ""}
+            {unit !== "m" ? `• ${(distanceFt * 0.3048).toFixed(2)}m  ` : ""}
+            {unit !== "in" ? `• ${(distanceFt * 12).toFixed(1)}in` : ""}
+          </Text>
+        </View>
+      )}
     </View>
   );
 }
+
+
 
 function MiniCell({ label, value }) {
   return (
@@ -235,4 +290,30 @@ const styles = StyleSheet.create({
   toggleRow:    { flexDirection: "row", alignItems: "center", justifyContent: "space-between",
                   marginTop: 4, paddingTop: 8, borderTopWidth: 1, borderTopColor: "#e1e4e8" },
   toggleLabel:  { fontSize: 12, color: "#57606a", fontWeight: "600" },
+
+  unitSelector: {
+    flexDirection: "row",
+    gap: 3,
+    backgroundColor: "#f6f8fa",
+    padding: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+  },
+  unitBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  unitBtnActive: {
+    backgroundColor: "#1f6feb",
+  },
+  unitBtnText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#57606a",
+  },
+  unitBtnTextActive: {
+    color: "#ffffff",
+  },
 });

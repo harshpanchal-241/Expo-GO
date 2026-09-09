@@ -32,11 +32,21 @@ export default function CalibrationPanel({
   const pipelineState = pipeline?.getState?.() ?? {};
   const { rawRssi, filteredRssi } = pipelineState;
 
+  const [unit,        setUnit]        = useState("ft"); // "ft" | "m" | "in"
+
   // Live distance estimate using current txPower and n
   const distM = (filteredRssi !== null)
     ? Math.pow(10, (txPower - filteredRssi) / (10 * pathLossN))
     : null;
   const distFt = distM !== null ? distM * 3.28084 : null;
+  const distIn = distM !== null ? Number((distM * 39.3701).toFixed(1)) : null;
+
+  let distanceDisplay = "—";
+  if (distM !== null) {
+    if (unit === "m") distanceDisplay = `${distM.toFixed(2)} m`;
+    else if (unit === "in") distanceDisplay = `${distIn} in`;
+    else distanceDisplay = `${distFt.toFixed(1)} ft`;
+  }
 
   async function startCalibration() {
     if (!pipeline) return;
@@ -85,22 +95,53 @@ export default function CalibrationPanel({
 
   return (
     <View style={styles.card}>
-      {/* Header */}
+      {/* Header with Unit Selector */}
       <View style={styles.row}>
-        <View style={[styles.badge, { backgroundColor: beaconNum === 1 ? "#ddf4ff" : "#f3f0ff" }]}>
-          <Text style={[styles.badgeText, { color: beaconNum === 1 ? "#0369a1" : "#6d28d9" }]}>
-            B{beaconNum}
-          </Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1 }}>
+          <View style={[styles.badge, { backgroundColor: beaconNum === 1 ? "#ddf4ff" : "#f3f0ff" }]}>
+            <Text style={[styles.badgeText, { color: beaconNum === 1 ? "#0369a1" : "#6d28d9" }]}>
+              B{beaconNum}
+            </Text>
+          </View>
+          <Text style={styles.beaconName} numberOfLines={1}>{beaconName || `Beacon ${beaconNum}`}</Text>
         </View>
-        <Text style={styles.beaconName} numberOfLines={1}>{beaconName || `Beacon ${beaconNum}`}</Text>
+
+        {/* Distance Unit Selector */}
+        <View style={styles.unitSelector}>
+          {[
+            { id: "ft", label: "ft" },
+            { id: "m",  label: "m" },
+            { id: "in", label: "in" },
+          ].map((u) => (
+            <Pressable
+              key={u.id}
+              onPress={() => setUnit(u.id)}
+              style={[styles.unitBtn, unit === u.id && styles.unitBtnActive]}
+            >
+              <Text style={[styles.unitBtnText, unit === u.id && styles.unitBtnTextActive]}>
+                {u.label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
       </View>
 
       {/* Live RSSI readout */}
       <View style={styles.readoutRow}>
         <ReadoutCell label="Raw RSSI"      value={rawRssi      != null ? `${rawRssi} dBm`       : "—"} color={statusColor} />
         <ReadoutCell label="Filtered RSSI" value={filteredRssi != null ? `${filteredRssi} dBm`  : "—"} color={statusColor} />
-        <ReadoutCell label="Est. Distance" value={distFt       != null ? `${distFt.toFixed(1)} ft` : "—"} color="#1f6feb" />
+        <ReadoutCell label={`Est. Dist (${unit})`} value={distanceDisplay} color="#1f6feb" />
       </View>
+
+      {/* Multi-Unit Conversion Line */}
+      {distM !== null && (
+        <View style={styles.conversionLine}>
+          <Text style={styles.conversionLineText}>
+            Conversions: {unit !== "ft" ? `${distFt.toFixed(1)} ft  ` : ""}{unit !== "m" ? `• ${distM.toFixed(2)} m  ` : ""}{unit !== "in" ? `• ${distIn} in` : ""}
+          </Text>
+        </View>
+      )}
+
 
       {/* Calibrate at 1 m */}
       <Text style={styles.instruction}>
@@ -203,4 +244,42 @@ const styles = StyleSheet.create({
   manualInput:{ borderWidth: 1, borderColor: "#d0d7de", borderRadius: 8, paddingHorizontal: 10,
                 paddingVertical: 6, fontSize: 13, fontWeight: "700", color: "#24292f",
                 backgroundColor: "#f6f8fa", width: 90, textAlign: "right" },
+
+  unitSelector: {
+    flexDirection: "row",
+    gap: 3,
+    backgroundColor: "#f6f8fa",
+    padding: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#d0d7de",
+  },
+  unitBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  unitBtnActive: {
+    backgroundColor: "#1f6feb",
+  },
+  unitBtnText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#57606a",
+  },
+  unitBtnTextActive: {
+    color: "#ffffff",
+  },
+
+  conversionLine: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    marginTop: -4,
+    marginBottom: 8,
+  },
+  conversionLineText: {
+    fontSize: 10,
+    color: "#57606a",
+    fontWeight: "600",
+  },
 });
